@@ -7,7 +7,7 @@ use object_store::{Attributes, Error as ObjectStoreError, ObjectStore, PutOption
 use uuid::Uuid;
 
 use super::storage::{ObjectStoreRef, utils::commit_uri_from_version};
-use super::{CommitOrBytes, LogStore, LogStoreConfig};
+use super::{CommitOrBytes, CommitPayloadMode, LogStore, LogStoreConfig};
 use crate::DeltaResult;
 use crate::kernel::Version;
 use crate::kernel::transaction::TransactionError;
@@ -57,6 +57,10 @@ impl DefaultLogStore {
 impl LogStore for DefaultLogStore {
     fn name(&self) -> String {
         "DefaultLogStore".into()
+    }
+
+    fn commit_payload_mode(&self) -> CommitPayloadMode {
+        CommitPayloadMode::LogBytes
     }
 
     async fn read_commit_entry(&self, version: Version) -> DeltaResult<Option<Bytes>> {

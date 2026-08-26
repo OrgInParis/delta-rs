@@ -9,8 +9,7 @@ compile_error!(
 
 use dashmap::DashMap;
 use deltalake_core::logstore::{
-    LogStore, LogStoreFactory, StorageConfig, default_logstore, logstore_factories,
-    object_store::RetryConfig,
+    LogStore, LogStoreFactory, StorageConfig, logstore_factories, object_store::RetryConfig,
 };
 use reqwest::Url;
 use reqwest::header::{AUTHORIZATION, HeaderValue, InvalidHeaderValue};
@@ -34,16 +33,18 @@ use crate::models::{
 
 use deltalake_core::data_catalog::DataCatalogResult;
 use deltalake_core::{
-    DataCatalog, DataCatalogError, DeltaResult, DeltaTableBuilder, DeltaTableError,
-    ObjectStoreError, Path, ensure_table_uri,
+    DataCatalog, DataCatalogError, DeltaResult, DeltaTableError, ObjectStoreError, Path,
 };
 
 use crate::client::retry::*;
 use deltalake_core::logstore::{
     ObjectStoreFactory, ObjectStoreRef, config::str_is_truthy, object_store_factories,
 };
+mod catalog_managed;
+pub use catalog_managed::ManagedDeltaTableCreate;
 pub mod client;
 pub mod credential;
+pub mod delta;
 
 const STORE_NAME: &str = "UnityCatalogObjectStore";
 #[cfg(feature = "datafusion")]
@@ -67,6 +68,64 @@ pub enum UnityCatalogError {
         /// The underlying reqwest_middleware::Error
         #[from]
         source: reqwest_middleware::Error,
+    },
+
+    /// A Delta Catalog API endpoint returned a structured non-success response.
+    #[error("Delta Catalog API returned HTTP {status} ({error_type}): {message}")]
+    DeltaApi {
+        /// HTTP response status.
+        status: u16,
+        /// Stable Delta Catalog error type.
+        error_type: String,
+        /// Server-provided diagnostic.
+        message: String,
+    },
+
+    /// A successful Delta Catalog response did not match the declared wire contract.
+    #[error("Delta Catalog API returned an invalid {response} response: {source}")]
+    InvalidDeltaResponse {
+        /// Response contract being decoded.
+        response: &'static str,
+        /// JSON decoding error.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// The catalog and client did not negotiate the required Delta Catalog protocol.
+    #[error("Delta Catalog negotiated protocol {actual}; expected {expected}")]
+    UnsupportedDeltaProtocol {
+        /// Protocol implemented by this client.
+        expected: &'static str,
+        /// Protocol selected by the server.
+        actual: String,
+    },
+
+    /// The negotiated Delta Catalog configuration omitted a required operation.
+    #[error("Delta Catalog does not advertise required endpoint {endpoint}")]
+    MissingDeltaEndpoint {
+        /// Endpoint signature required by the requested operation.
+        endpoint: &'static str,
+    },
+
+    /// A catalog table reference did not satisfy the three-part `uc://` contract.
+    #[error("Invalid Delta Catalog table reference: {table_uri}")]
+    InvalidDeltaTableReference {
+        /// Rejected table URI.
+        table_uri: String,
+    },
+
+    /// A vended storage credential did not satisfy the requested scope or provider contract.
+    #[error("Delta Catalog returned unusable storage credentials: {reason}")]
+    InvalidDeltaCredential {
+        /// Stable reason code.
+        reason: &'static str,
+    },
+
+    /// The configured catalog access intent was absent or invalid.
+    #[error("Delta Catalog access intent must be READ or READ_WRITE, got {actual}")]
+    InvalidDeltaAccessIntent {
+        /// Rejected value, or `missing` when the option was absent.
+        actual: String,
     },
 
     /// Request returned error response
@@ -939,29 +998,11 @@ impl ObjectStoreFactory for UnityCatalogFactory {
         table_uri: &Url,
         config: &StorageConfig,
     ) -> DeltaResult<(ObjectStoreRef, Path)> {
-        let (table_path, temp_creds) = UnityCatalogBuilder::execute_uc_future(
-            UnityCatalogBuilder::get_uc_location_and_token(table_uri.as_str(), Some(&config.raw)),
+        let log_store = UnityCatalogBuilder::execute_uc_future(
+            catalog_managed::build_catalog_managed_log_store(table_uri.as_str(), config),
         )??;
-
-        let mut storage_options = config.raw.clone();
-        storage_options.extend(temp_creds);
-
-        // TODO(roeap): we should not have to go through the table here.
-        // ideally we just create the right storage ...
-        let table_url = ensure_table_uri(&table_path)?;
-        let mut builder = DeltaTableBuilder::from_url(table_url)?;
-
-        if let Some(runtime) = &config.runtime {
-            builder = builder.with_io_runtime(runtime.clone());
-        }
-
-        if !storage_options.is_empty() {
-            builder = builder.with_storage_options(storage_options.clone());
-        }
         let prefix = Path::parse(table_uri.path())?;
-        let store = builder.build_storage()?.object_store(None);
-
-        Ok((store, prefix))
+        Ok((log_store.object_store(None), prefix))
     }
 }
 
@@ -973,12 +1014,11 @@ impl LogStoreFactory for UnityCatalogFactory {
         location: &Url,
         options: &StorageConfig,
     ) -> DeltaResult<Arc<dyn LogStore>> {
-        Ok(default_logstore(
-            prefixed_store,
-            root_store,
-            location,
+        let _ = (prefixed_store, root_store);
+        UnityCatalogBuilder::execute_uc_future(catalog_managed::build_catalog_managed_log_store(
+            location.as_str(),
             options,
-        ))
+        ))?
     }
 }
 

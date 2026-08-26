@@ -31,7 +31,7 @@ use delta_kernel::snapshot::Snapshot as KernelSnapshot;
 use delta_kernel::table_configuration::TableConfiguration;
 use delta_kernel::table_properties::TableProperties;
 use delta_kernel::{
-    Engine, EvaluationHandler, Expression, ExpressionEvaluator, PredicateRef, Version,
+    Engine, EvaluationHandler, Expression, ExpressionEvaluator, LogPath, PredicateRef, Version,
 };
 use futures::future::ready;
 use futures::stream::{BoxStream, once};
@@ -45,7 +45,7 @@ use super::{Action, CommitInfo, Metadata, Protocol};
 use crate::checkpoints::parse_last_checkpoint_hint;
 use crate::kernel::arrow::engine_ext::{ExpressionEvaluatorExt, rb_from_scan_meta};
 use crate::kernel::{ARROW_HANDLER, StructType, spawn_blocking_with_span};
-use crate::logstore::{LogStore, LogStoreExt};
+use crate::logstore::{CatalogManagedState, LogStore, LogStoreExt};
 use crate::{DeltaResult, DeltaTableConfig, DeltaTableError};
 
 pub use self::log_data::*;
@@ -231,10 +231,37 @@ impl Snapshot {
         config: DeltaTableConfig,
         version: Option<Version>,
     ) -> DeltaResult<Self> {
+        Self::try_new_with_engine_and_catalog_state(engine, table_root, config, version, None).await
+    }
+
+    async fn try_new_with_engine_and_catalog_state(
+        engine: Arc<dyn Engine>,
+        table_root: Url,
+        config: DeltaTableConfig,
+        version: Option<Version>,
+        catalog_state: Option<CatalogManagedState>,
+    ) -> DeltaResult<Self> {
         let snapshot = match spawn_blocking_with_span(move || {
-            let mut builder = KernelSnapshot::builder_for(table_root);
+            let mut builder = KernelSnapshot::builder_for(table_root.clone());
             if let Some(version) = version {
                 builder = builder.at_version(version);
+            }
+            if let Some(state) = catalog_state {
+                let log_tail = state
+                    .commits()
+                    .iter()
+                    .map(|commit| {
+                        LogPath::staged_commit(
+                            table_root.clone(),
+                            commit.file_name(),
+                            commit.file_modification_timestamp(),
+                            commit.file_size(),
+                        )
+                    })
+                    .collect::<Result<Vec<LogPath>, delta_kernel::Error>>()?;
+                builder = builder
+                    .with_log_tail(log_tail)
+                    .with_max_catalog_version(state.latest_version());
             }
             builder.build(engine.as_ref())
         })
@@ -276,7 +303,15 @@ impl Snapshot {
             table_root.set_path(&format!("{}/", table_root.path()));
         }
 
-        Self::try_new_with_engine(engine, table_root, config, version).await
+        let catalog_state = log_store.catalog_managed_state().await?;
+        Self::try_new_with_engine_and_catalog_state(
+            engine,
+            table_root,
+            config,
+            version,
+            catalog_state,
+        )
+        .await
     }
 
     /// Create a [`ScanBuilder`] borrowing this snapshot to configure a read of the table.
@@ -294,6 +329,16 @@ impl Snapshot {
         self: Arc<Self>,
         engine: Arc<dyn Engine>,
         target_version: Option<Version>,
+    ) -> DeltaResult<Arc<Self>> {
+        self.update_with_catalog_state(engine, target_version, None)
+            .await
+    }
+
+    async fn update_with_catalog_state(
+        self: Arc<Self>,
+        engine: Arc<dyn Engine>,
+        target_version: Option<Version>,
+        catalog_state: Option<CatalogManagedState>,
     ) -> DeltaResult<Arc<Self>> {
         let current_version = self.version();
         if let Some(version) = target_version {
@@ -314,11 +359,29 @@ impl Snapshot {
         }
 
         let current = self.inner.clone();
+        let table_root = current.table_root().clone();
         let task_engine = engine.clone();
         let snapshot = spawn_blocking_with_span(move || {
             let mut builder = KernelSnapshot::builder_from(current);
             if let Some(version) = target_version {
                 builder = builder.at_version(version);
+            }
+            if let Some(state) = catalog_state {
+                let log_tail = state
+                    .commits()
+                    .iter()
+                    .map(|commit| {
+                        LogPath::staged_commit(
+                            table_root.clone(),
+                            commit.file_name(),
+                            commit.file_modification_timestamp(),
+                            commit.file_size(),
+                        )
+                    })
+                    .collect::<Result<Vec<LogPath>, delta_kernel::Error>>()?;
+                builder = builder
+                    .with_log_tail(log_tail)
+                    .with_max_catalog_version(state.latest_version());
             }
             builder.build(task_engine.as_ref())
         })
@@ -1388,9 +1451,10 @@ impl EagerSnapshot {
         target_version: Option<Version>,
     ) -> DeltaResult<()> {
         let previous_snapshot = self.snapshot.clone();
+        let catalog_state = log_store.catalog_managed_state().await?;
         let updated_snapshot = previous_snapshot
             .clone()
-            .update(log_store.engine(None), target_version)
+            .update_with_catalog_state(log_store.engine(None), target_version, catalog_state)
             .await?;
         if Arc::ptr_eq(&updated_snapshot, &previous_snapshot) {
             return Ok(());

@@ -1086,6 +1086,10 @@ pub struct CommitInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub in_commit_timestamp: Option<i64>,
 
+    /// Stable transaction identifier used to reconcile coordinated commit retries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub txn_id: Option<String>,
+
     /// Id of the user invoking the commit
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,

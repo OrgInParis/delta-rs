@@ -240,6 +240,10 @@ impl LogStore for LakeFSLogStore {
         "LakeFSLogStore".into()
     }
 
+    fn commit_payload_mode(&self) -> CommitPayloadMode {
+        CommitPayloadMode::LogBytes
+    }
+
     async fn read_commit_entry(&self, version: Version) -> DeltaResult<Option<Bytes>> {
         read_commit_entry(
             &self.prefixed_registry.get_store(self.config.location())?,

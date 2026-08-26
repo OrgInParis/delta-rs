@@ -100,6 +100,161 @@ pub(crate) mod storage;
 /// Parquet reader for object storage
 pub mod parquet_reader;
 
+/// How a log store accepts a prepared commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitPayloadMode {
+    /// The transaction writes a temporary object and passes its path to the log store.
+    TemporaryPath,
+    /// The transaction passes the serialized commit bytes directly to the log store.
+    LogBytes,
+    /// The transaction passes serialized bytes and the typed actions that produced them.
+    LogBytesWithActions,
+}
+
+/// One catalog-ratified commit that has not necessarily been published to the Delta log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogManagedCommit {
+    version: Version,
+    file_name: String,
+    timestamp: i64,
+    file_size: u64,
+    file_modification_timestamp: i64,
+}
+
+impl CatalogManagedCommit {
+    /// Construct a catalog commit after validating its staged filename.
+    pub fn try_new(
+        version: Version,
+        file_name: String,
+        timestamp: i64,
+        file_size: u64,
+        file_modification_timestamp: i64,
+    ) -> Result<Self, CatalogManagedStateError> {
+        let expected_prefix = format!("{version:020}.");
+        let operation = file_name
+            .strip_prefix(&expected_prefix)
+            .and_then(|name| name.strip_suffix(".json"))
+            .ok_or_else(|| CatalogManagedStateError::InvalidFileName {
+                version,
+                file_name: file_name.clone(),
+            })?;
+        Uuid::parse_str(operation).map_err(|_| CatalogManagedStateError::InvalidFileName {
+            version,
+            file_name: file_name.clone(),
+        })?;
+
+        Ok(Self {
+            version,
+            file_name,
+            timestamp,
+            file_size,
+            file_modification_timestamp,
+        })
+    }
+
+    /// Ratified table version represented by this commit.
+    pub fn version(&self) -> Version {
+        self.version
+    }
+
+    /// Filename under `_delta_log/_staged_commits`.
+    pub fn file_name(&self) -> &str {
+        &self.file_name
+    }
+
+    /// In-commit timestamp in epoch milliseconds.
+    pub fn timestamp(&self) -> i64 {
+        self.timestamp
+    }
+
+    /// Serialized commit size in bytes.
+    pub fn file_size(&self) -> u64 {
+        self.file_size
+    }
+
+    /// Staged object's modification time in epoch milliseconds.
+    pub fn file_modification_timestamp(&self) -> i64 {
+        self.file_modification_timestamp
+    }
+}
+
+/// Atomic catalog state required to construct a catalog-managed snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogManagedState {
+    latest_version: Version,
+    commits: Vec<CatalogManagedCommit>,
+}
+
+impl CatalogManagedState {
+    /// Validate the catalog's contiguous, ascending unbackfilled commit tail.
+    pub fn try_new(
+        latest_version: Version,
+        commits: Vec<CatalogManagedCommit>,
+    ) -> Result<Self, CatalogManagedStateError> {
+        for pair in commits.windows(2) {
+            if pair[0].version + 1 != pair[1].version {
+                return Err(CatalogManagedStateError::NonContiguousTail {
+                    previous: pair[0].version,
+                    actual: pair[1].version,
+                });
+            }
+        }
+        if let Some(last) = commits.last()
+            && last.version != latest_version
+        {
+            return Err(CatalogManagedStateError::TailVersionMismatch {
+                latest_version,
+                tail_version: last.version,
+            });
+        }
+        Ok(Self {
+            latest_version,
+            commits,
+        })
+    }
+
+    /// Latest version ratified by the catalog.
+    pub fn latest_version(&self) -> Version {
+        self.latest_version
+    }
+
+    /// Ascending, contiguous unbackfilled commit tail.
+    pub fn commits(&self) -> &[CatalogManagedCommit] {
+        &self.commits
+    }
+}
+
+/// Invalid catalog-managed state supplied to delta-rs.
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+pub enum CatalogManagedStateError {
+    /// A staged filename does not encode the matching version and an operation UUID.
+    #[error("catalog-managed commit {version} has invalid staged filename {file_name}")]
+    InvalidFileName {
+        /// Commit version.
+        version: Version,
+        /// Invalid staged filename.
+        file_name: String,
+    },
+    /// The unbackfilled tail contains a gap, duplicate, or descending pair.
+    #[error("catalog-managed commit tail is not contiguous: {previous} is followed by {actual}")]
+    NonContiguousTail {
+        /// Previous tail version.
+        previous: Version,
+        /// Actual following version.
+        actual: Version,
+    },
+    /// The tail does not end at the catalog's latest ratified version.
+    #[error(
+        "catalog-managed commit tail ends at {tail_version}, but latest ratified version is {latest_version}"
+    )]
+    TailVersionMismatch {
+        /// Latest ratified version.
+        latest_version: Version,
+        /// Last version in the returned tail.
+        tail_version: Version,
+    },
+}
+
 /// Internal trait to handle object store configuration and initialization.
 trait LogStoreFactoryExt {
     /// Create a new log store with the given options.
@@ -314,6 +469,15 @@ pub enum CommitOrBytes {
     TmpCommit(Path),
     /// Bytes of the log, to be used by logstoers which use Conditional Put
     LogBytes(Bytes),
+    /// Bytes and typed actions for coordinators that must update catalog metadata atomically.
+    LogBytesWithActions {
+        /// Serialized commit bytes.
+        bytes: Bytes,
+        /// Typed actions that produced the bytes.
+        actions: Arc<[Action]>,
+        /// Metadata from the read snapshot, used to derive exact catalog metadata removals.
+        previous_metadata: Option<crate::kernel::Metadata>,
+    },
 }
 
 /// Configuration parameters for a log store
@@ -374,9 +538,25 @@ pub trait LogStore: Send + Sync + AsAny {
     /// Return the name of this LogStore implementation
     fn name(&self) -> String;
 
+    /// Whether transaction visibility is owned by a coordinating catalog.
+    fn is_catalog_managed(&self) -> bool {
+        false
+    }
+
+    /// Return the representation this store accepts for a prepared commit.
+    fn commit_payload_mode(&self) -> CommitPayloadMode {
+        CommitPayloadMode::TemporaryPath
+    }
+
     /// Trigger sync operation on log store to.
     async fn refresh(&self) -> DeltaResult<()> {
         Ok(())
+    }
+
+    /// Return atomic catalog state when the catalog, rather than filesystem listing, owns
+    /// transaction visibility.
+    async fn catalog_managed_state(&self) -> DeltaResult<Option<CatalogManagedState>> {
+        Ok(None)
     }
 
     /// Read data for commit entry with the given version.
@@ -523,8 +703,20 @@ impl<T: LogStore + ?Sized> LogStore for Arc<T> {
         T::name(self)
     }
 
+    fn is_catalog_managed(&self) -> bool {
+        T::is_catalog_managed(self)
+    }
+
+    fn commit_payload_mode(&self) -> CommitPayloadMode {
+        T::commit_payload_mode(self)
+    }
+
     async fn refresh(&self) -> DeltaResult<()> {
         T::refresh(self).await
+    }
+
+    async fn catalog_managed_state(&self) -> DeltaResult<Option<CatalogManagedState>> {
+        T::catalog_managed_state(self).await
     }
 
     async fn read_commit_entry(&self, version: Version) -> DeltaResult<Option<Bytes>> {
@@ -933,6 +1125,49 @@ pub(crate) mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    fn catalog_commit(version: Version) -> CatalogManagedCommit {
+        CatalogManagedCommit::try_new(
+            version,
+            format!("{version:020}.{}.json", Uuid::new_v4()),
+            1,
+            2,
+            3,
+        )
+        .expect("test commit metadata is valid")
+    }
+
+    #[test]
+    fn catalog_managed_commit_requires_matching_version_and_uuid() {
+        let uuid = Uuid::new_v4();
+        assert!(
+            CatalogManagedCommit::try_new(2, format!("{:020}.{uuid}.json", 2), 1, 2, 3).is_ok()
+        );
+        assert!(
+            CatalogManagedCommit::try_new(2, format!("{:020}.{uuid}.json", 3), 1, 2, 3).is_err()
+        );
+        assert!(
+            CatalogManagedCommit::try_new(2, format!("{:020}.not-a-uuid.json", 2), 1, 2, 3,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn catalog_managed_state_requires_a_contiguous_tail_ending_at_latest() {
+        assert!(
+            CatalogManagedState::try_new(4, vec![catalog_commit(2), catalog_commit(3)]).is_err()
+        );
+        assert!(
+            CatalogManagedState::try_new(4, vec![catalog_commit(2), catalog_commit(4)]).is_err()
+        );
+        let state = CatalogManagedState::try_new(
+            4,
+            vec![catalog_commit(2), catalog_commit(3), catalog_commit(4)],
+        )
+        .expect("the tail is contiguous and ends at latest");
+        assert_eq!(state.latest_version(), 4);
+        assert_eq!(state.commits().len(), 3);
+    }
 
     #[test]
     fn test_logstore_config_ctor() {

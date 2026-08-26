@@ -220,9 +220,14 @@ impl ProtocolChecker {
 
     /// Check if delta-rs can write to the given delta table.
     pub fn can_write_to(&self, snapshot: &dyn TableReference) -> Result<(), TransactionError> {
+        self.can_write_to_protocol(snapshot.protocol())
+    }
+
+    /// Check whether delta-rs can write a table carrying the given protocol.
+    pub fn can_write_to_protocol(&self, protocol: &Protocol) -> Result<(), TransactionError> {
         // NOTE: writers must always support all required reader features
-        self.can_read_from(snapshot)?;
-        let min_writer_version = snapshot.protocol().min_writer_version();
+        self.can_read_from_protocol(protocol)?;
+        let min_writer_version = protocol.min_writer_version();
 
         let required_features: Option<HashSet<TableFeature>> = match min_writer_version {
             0 | 1 => None,
@@ -231,7 +236,7 @@ impl ProtocolChecker {
             4 => Some(WRITER_V4.clone()),
             5 => Some(WRITER_V5.clone()),
             6 => Some(WRITER_V6.clone()),
-            _ => snapshot.protocol().writer_features_set(),
+            _ => protocol.writer_features_set(),
         };
 
         trace!("my writer features: {:?}", self.writer_features);
@@ -255,6 +260,18 @@ impl ProtocolChecker {
         operation: &DeltaOperation,
     ) -> Result<(), TransactionError> {
         self.can_write_to(snapshot)?;
+
+        if snapshot
+            .protocol()
+            .reader_features()
+            .is_some_and(|features| features.contains(&TableFeature::CatalogManaged))
+            && matches!(
+                operation,
+                DeltaOperation::VacuumStart { .. } | DeltaOperation::VacuumEnd { .. }
+            )
+        {
+            return Err(TransactionError::CatalogManagedVacuumUnsupported);
+        }
 
         // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#append-only-tables
         let append_only_enabled = if snapshot.protocol().min_writer_version() < 2 {
@@ -303,6 +320,8 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     reader_features.insert(TableFeature::VariantType);
     reader_features.insert(TableFeature::VariantTypePreview);
     reader_features.insert(TableFeature::V2Checkpoint);
+    reader_features.insert(TableFeature::CatalogManaged);
+    reader_features.insert(TableFeature::VacuumProtocolCheck);
     #[cfg(feature = "nanosecond-timestamps")]
     reader_features.insert(TableFeature::TimestampNanos);
     #[cfg(feature = "datafusion")]
@@ -318,6 +337,9 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     writer_features.insert(TableFeature::VariantType);
     writer_features.insert(TableFeature::VariantTypePreview);
     writer_features.insert(TableFeature::V2Checkpoint);
+    writer_features.insert(TableFeature::CatalogManaged);
+    writer_features.insert(TableFeature::InCommitTimestamp);
+    writer_features.insert(TableFeature::VacuumProtocolCheck);
     #[cfg(feature = "datafusion")]
     {
         writer_features.insert(TableFeature::ChangeDataFeed);

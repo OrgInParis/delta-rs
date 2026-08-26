@@ -98,7 +98,7 @@ use crate::kernel::{
     Action, CommitInfo, EagerSnapshot, IsolationLevel, Metadata, Protocol, Transaction, Version,
 };
 use crate::logstore::ObjectStoreRef;
-use crate::logstore::{CommitOrBytes, LogStoreRef};
+use crate::logstore::{CommitOrBytes, LogStore, LogStoreRef, get_actions};
 use crate::operations::CustomExecuteHandler;
 use crate::protocol::{DeltaOperation, operation_parameter_value};
 use crate::protocol::{cleanup_expired_logs_for, create_checkpoint_for};
@@ -123,6 +123,8 @@ pub(crate) const DEFAULT_RETRIES: usize = 15;
 // Keep this list aligned with validate_reserved_commit_metadata in python/src/lib.rs.
 const RESERVED_COMMIT_INFO_KEYS: &[&str] = &[
     "timestamp",
+    "inCommitTimestamp",
+    "txnId",
     "userId",
     "userName",
     "operation",
@@ -211,6 +213,33 @@ pub enum TransactionError {
     #[error("Table features must be specified, please specify: {0:?}")]
     TableFeaturesRequired(TableFeature),
 
+    /// Delta-rs cannot safely vacuum a catalog-managed table without catalog maintenance state.
+    #[error("VACUUM is not supported for catalog-managed tables")]
+    CatalogManagedVacuumUnsupported,
+
+    /// A table requiring in-commit timestamps had no commitInfo in its preceding version.
+    #[error("Delta version {version} has no commitInfo required for in-commit timestamp ordering")]
+    PreviousCommitInfoMissing {
+        /// Preceding table version.
+        version: Version,
+    },
+
+    /// A table requiring in-commit timestamps had no timestamp in its preceding commitInfo.
+    #[error("Delta version {version} has no inCommitTimestamp")]
+    PreviousInCommitTimestampMissing {
+        /// Preceding table version.
+        version: Version,
+    },
+
+    /// The preceding in-commit timestamp cannot be advanced within the int64 wire type.
+    #[error("Delta version {version} has maximum inCommitTimestamp {timestamp}")]
+    InCommitTimestampOverflow {
+        /// Preceding table version.
+        version: Version,
+        /// Timestamp that could not be incremented.
+        timestamp: i64,
+    },
+
     /// The transaction failed to commit due to an error in an implementation-specific layer.
     /// Currently used by DynamoDb-backed S3 log store when database operations fail.
     #[error("Transaction failed: {msg}")]
@@ -296,6 +325,45 @@ impl TableReference for DeltaTableState {
     fn eager_snapshot(&self) -> &EagerSnapshot {
         &self.snapshot
     }
+}
+
+fn requires_in_commit_timestamp(protocol: &Protocol) -> bool {
+    protocol
+        .writer_features()
+        .is_some_and(|features| features.contains(&TableFeature::InCommitTimestamp))
+}
+
+async fn ordered_in_commit_timestamp(
+    log_store: &dyn LogStore,
+    table: &dyn TableReference,
+    proposed: i64,
+) -> DeltaResult<i64> {
+    let version = table.eager_snapshot().version();
+    let bytes = log_store
+        .read_commit_entry(version)
+        .await?
+        .ok_or(DeltaTableError::InvalidVersion(version))?;
+    let actions = get_actions(version, &bytes)?;
+    let previous = actions
+        .iter()
+        .find_map(|action| match action {
+            Action::CommitInfo(info) => Some(info),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            DeltaTableError::from(TransactionError::PreviousCommitInfoMissing { version })
+        })?
+        .in_commit_timestamp
+        .ok_or_else(|| {
+            DeltaTableError::from(TransactionError::PreviousInCommitTimestampMissing { version })
+        })?;
+    let minimum = previous.checked_add(1).ok_or_else(|| {
+        DeltaTableError::from(TransactionError::InCommitTimestampOverflow {
+            version,
+            timestamp: previous,
+        })
+    })?;
+    Ok(proposed.max(minimum))
 }
 
 /// Data that was actually written to the log store.
@@ -736,7 +804,7 @@ impl<'a> std::future::IntoFuture for PreCommit<'a> {
 impl<'a> PreCommit<'a> {
     /// Prepare the commit but do not finalize it
     pub fn into_prepared_commit_future(self) -> BoxFuture<'a, DeltaResult<PreparedCommit<'a>>> {
-        let this = self;
+        let mut this = self;
 
         // Write delta log entry as temporary file to storage. For the actual commit,
         // the temporary file is moved (atomic rename) to the delta log folder within `commit` function.
@@ -751,23 +819,79 @@ impl<'a> PreCommit<'a> {
         }
 
         Box::pin(async move {
+            let catalog_managed_payload = this.log_store.commit_payload_mode()
+                == crate::logstore::CommitPayloadMode::LogBytesWithActions;
+            let existing_protocol_requires_timestamp = this
+                .table_data
+                .is_some_and(|table| requires_in_commit_timestamp(table.protocol()));
+            let committed_protocol_requires_timestamp = this.data.actions.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::Protocol(protocol) if requires_in_commit_timestamp(protocol)
+                )
+            });
+            let requires_timestamp = existing_protocol_requires_timestamp
+                || committed_protocol_requires_timestamp
+                || catalog_managed_payload;
+
+            let wall_clock = Utc::now().timestamp_millis();
+            let proposed_timestamp = this
+                .data
+                .actions
+                .iter()
+                .find_map(|action| match action {
+                    Action::CommitInfo(info) => info.in_commit_timestamp.or(info.timestamp),
+                    _ => None,
+                })
+                .unwrap_or(wall_clock);
+            let in_commit_timestamp = match this.table_data {
+                Some(table) if requires_in_commit_timestamp(table.protocol()) => {
+                    ordered_in_commit_timestamp(this.log_store.as_ref(), table, proposed_timestamp)
+                        .await?
+                }
+                Some(_) | None => proposed_timestamp,
+            };
+
+            if let Some(Action::CommitInfo(commit_info)) = this
+                .data
+                .actions
+                .iter_mut()
+                .find(|action| matches!(action, Action::CommitInfo(..)))
+            {
+                commit_info.timestamp.get_or_insert(wall_clock);
+                if requires_timestamp {
+                    commit_info.in_commit_timestamp = Some(in_commit_timestamp);
+                }
+                if catalog_managed_payload {
+                    commit_info
+                        .txn_id
+                        .get_or_insert_with(|| this.operation_id.to_string());
+                }
+            }
             if let Some(table_reference) = this.table_data {
                 PROTOCOL.can_commit(table_reference, &this.data.actions, &this.data.operation)?;
             }
             let log_entry = this.data.get_bytes()?;
+            let previous_metadata: Option<Metadata> = this
+                .table_data
+                .map(|table_reference| table_reference.metadata().clone());
 
-            // With the DefaultLogStore & LakeFSLogstore, we just pass the bytes around, since we use conditionalPuts
-            // Other stores will use tmp_commits
-            let commit_or_bytes = if ["LakeFSLogStore", "DefaultLogStore"]
-                .contains(&this.log_store.name().as_str())
-            {
-                CommitOrBytes::LogBytes(log_entry)
-            } else {
-                write_tmp_commit(
-                    log_entry,
-                    this.log_store.object_store(Some(this.operation_id)),
-                )
-                .await?
+            let commit_or_bytes = match this.log_store.commit_payload_mode() {
+                crate::logstore::CommitPayloadMode::LogBytes => CommitOrBytes::LogBytes(log_entry),
+                crate::logstore::CommitPayloadMode::LogBytesWithActions => {
+                    CommitOrBytes::LogBytesWithActions {
+                        bytes: log_entry,
+                        actions: this.data.actions.clone().into(),
+                        previous_metadata,
+                    }
+                }
+                crate::logstore::CommitPayloadMode::TemporaryPath => {
+                    write_tmp_commit(
+                        log_entry,
+                        this.log_store.object_store(Some(this.operation_id)),
+                    )
+                    .await?
+                }
             };
 
             Ok(PreparedCommit {
@@ -962,6 +1086,22 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
                             };
                             CommitOrBytes::LogBytes(updated_bytes)
                         }
+                        CommitOrBytes::LogBytesWithActions {
+                            bytes,
+                            actions,
+                            previous_metadata,
+                        } => {
+                            let updated_bytes = if current_retries > 0 {
+                                CommitData::update_retry_count_in_bytes(bytes, current_retries)?
+                            } else {
+                                bytes.clone()
+                            };
+                            CommitOrBytes::LogBytesWithActions {
+                                bytes: updated_bytes,
+                                actions: actions.clone(),
+                                previous_metadata: previous_metadata.clone(),
+                            }
+                        }
                         CommitOrBytes::TmpCommit(_path) => {
                             // For TmpCommit stores, keep original behavior for now
                             // (these stores write to tmp file first, then rename)
@@ -1061,7 +1201,15 @@ impl PostCommit {
 
             let mut state = DeltaTableState { snapshot };
 
-            let cleanup_logs = if let Some(cleanup_logs) = self.cleanup_expired_logs {
+            // Catalog-managed checkpoints are legal only after the target version has been
+            // published. The commit coordinator can remain authoritative even when immediate
+            // publication fails, so the generic post-commit hook cannot prove that precondition.
+            // A catalog-aware maintenance path may create the checkpoint after proving backfill.
+            let create_checkpoint = self.create_checkpoint && !self.log_store.is_catalog_managed();
+
+            let cleanup_logs = if self.log_store.is_catalog_managed() {
+                false
+            } else if let Some(cleanup_logs) = self.cleanup_expired_logs {
                 cleanup_logs
             } else {
                 state.table_config().enable_expired_log_cleanup()
@@ -1072,14 +1220,14 @@ impl PostCommit {
                 custom_execute_handler
                     .before_post_commit_hook(
                         &self.log_store,
-                        cleanup_logs || self.create_checkpoint,
+                        cleanup_logs || create_checkpoint,
                         post_commit_operation_id,
                     )
                     .await?
             }
 
             let mut new_checkpoint_created = false;
-            if self.create_checkpoint {
+            if create_checkpoint {
                 // Execute create checkpoint hook
                 new_checkpoint_created = self
                     .create_checkpoint(

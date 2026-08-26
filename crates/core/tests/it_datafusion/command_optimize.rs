@@ -469,8 +469,23 @@ impl LogStore for OperationTrackingLogStore {
         self.inner.name()
     }
 
+    fn is_catalog_managed(&self) -> bool {
+        self.inner.is_catalog_managed()
+    }
+
+    fn commit_payload_mode(&self) -> deltalake_core::logstore::CommitPayloadMode {
+        self.inner.commit_payload_mode()
+    }
+
     async fn refresh(&self) -> deltalake_core::errors::DeltaResult<()> {
         self.inner.refresh().await
+    }
+
+    async fn catalog_managed_state(
+        &self,
+    ) -> deltalake_core::errors::DeltaResult<Option<deltalake_core::logstore::CatalogManagedState>>
+    {
+        self.inner.catalog_managed_state().await
     }
 
     async fn read_commit_entry(
