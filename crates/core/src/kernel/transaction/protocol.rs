@@ -261,6 +261,24 @@ impl ProtocolChecker {
     ) -> Result<(), TransactionError> {
         self.can_write_to(snapshot)?;
 
+        let mut metadata_domains = HashSet::new();
+        let contains_domain_metadata = actions.iter().try_fold(false, |present, action| {
+            let Action::DomainMetadata(metadata) = action else {
+                return Ok(present);
+            };
+            if !metadata_domains.insert(metadata.domain.as_str()) {
+                return Err(TransactionError::ConflictingDomainMetadata {
+                    domain: metadata.domain.clone(),
+                });
+            }
+            Ok(true)
+        })?;
+        self.check_can_write_feature(
+            snapshot.eager_snapshot(),
+            contains_domain_metadata,
+            TableFeature::DomainMetadata,
+        )?;
+
         if snapshot
             .protocol()
             .reader_features()
@@ -340,6 +358,7 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     writer_features.insert(TableFeature::CatalogManaged);
     writer_features.insert(TableFeature::InCommitTimestamp);
     writer_features.insert(TableFeature::VacuumProtocolCheck);
+    writer_features.insert(TableFeature::DomainMetadata);
     #[cfg(feature = "datafusion")]
     {
         writer_features.insert(TableFeature::ChangeDataFeed);

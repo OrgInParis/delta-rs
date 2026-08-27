@@ -2,8 +2,11 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        DeltaTable, DeltaTableBuilder, checkpoints, ensure_table_uri,
-        kernel::{Transaction, transaction::CommitProperties},
+        DeltaTable, DeltaTableBuilder, DeltaTableError, checkpoints, ensure_table_uri,
+        kernel::{
+            DomainMetadata, TableFeatures, Transaction,
+            transaction::{CommitProperties, TransactionError},
+        },
         protocol::SaveMode,
         writer::test_utils::get_record_batch,
     };
@@ -144,5 +147,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(txn_version, Some(3));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_domain_metadata_requires_the_feature_and_survives_a_checkpoint() {
+        let temporary = tempfile::tempdir().unwrap();
+        let location = std::fs::canonicalize(temporary.path()).unwrap();
+        let batch = get_record_batch(None, false);
+        let table = DeltaTable::try_from_url(ensure_table_uri(location.to_str().unwrap()).unwrap())
+            .await
+            .unwrap()
+            .write(vec![batch.clone()])
+            .await
+            .unwrap();
+        let domain = DomainMetadata {
+            domain: String::from("atp.test"),
+            configuration: String::from("{\"position\":1}"),
+            removed: false,
+        };
+
+        let refused = table
+            .clone()
+            .write(vec![batch.clone()])
+            .with_commit_properties(
+                CommitProperties::default().with_domain_metadata([domain.clone()]),
+            )
+            .await;
+        assert!(matches!(
+            refused,
+            Err(DeltaTableError::Transaction {
+                source: TransactionError::TableFeaturesRequired(
+                    delta_kernel::table_features::TableFeature::DomainMetadata
+                )
+            })
+        ));
+
+        let table = table
+            .add_feature()
+            .with_feature(TableFeatures::DomainMetadata)
+            .with_allow_protocol_versions_increase(true)
+            .await
+            .unwrap()
+            .write(vec![batch])
+            .with_commit_properties(CommitProperties::default().with_domain_metadata([domain]))
+            .await
+            .unwrap();
+        let persisted = table
+            .snapshot()
+            .unwrap()
+            .domain_metadata(&table.log_store(), "atp.test")
+            .await
+            .unwrap();
+        assert_eq!(persisted.as_deref(), Some("{\"position\":1}"));
+
+        checkpoints::create_checkpoint(&table, None).await.unwrap();
+        let reopened =
+            DeltaTableBuilder::from_url(ensure_table_uri(location.to_str().unwrap()).unwrap())
+                .unwrap()
+                .load()
+                .await
+                .unwrap();
+        let checkpointed = reopened
+            .snapshot()
+            .unwrap()
+            .domain_metadata(&reopened.log_store(), "atp.test")
+            .await
+            .unwrap();
+        assert_eq!(checkpointed.as_deref(), Some("{\"position\":1}"));
     }
 }

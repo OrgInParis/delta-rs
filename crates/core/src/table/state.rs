@@ -153,6 +153,15 @@ impl DeltaTableState {
         self.snapshot.transaction_version(log_store, app_id).await
     }
 
+    /// Return the current configuration for a native Delta metadata domain.
+    pub async fn domain_metadata(
+        &self,
+        log_store: &dyn LogStore,
+        domain: impl ToString,
+    ) -> DeltaResult<Option<String>> {
+        self.snapshot.domain_metadata(log_store, domain).await
+    }
+
     /// Obtain the Eager snapshot of the state
     pub fn snapshot(&self) -> &EagerSnapshot {
         &self.snapshot

@@ -58,6 +58,13 @@ pub enum CommitConflictError {
     #[error("Concurrent transaction failed.")]
     ConcurrentTransaction,
 
+    /// Two concurrent transactions attempted to update the same metadata domain.
+    #[error("A concurrent transaction updated metadata domain {domain}.")]
+    ConcurrentDomainMetadata {
+        /// Conflicting domain identifier.
+        domain: String,
+    },
+
     /// This exception can occur in the following cases:
     /// - When your Delta table is upgraded to a new version. For future operations to succeed
     ///   you may need to upgrade your Delta Lake version.
@@ -311,6 +318,16 @@ impl WinningCommitSummary {
             .collect()
     }
 
+    pub fn domain_metadata_domains(&self) -> HashSet<String> {
+        self.actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::DomainMetadata(metadata) => Some(metadata.domain.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn removed_files(&self) -> Vec<Remove> {
         self.actions
             .iter()
@@ -409,6 +426,7 @@ impl<'a> ConflictChecker<'a> {
     pub fn check_conflicts(&self) -> Result<(), CommitConflictError> {
         self.check_protocol_compatibility()?;
         self.check_no_metadata_updates()?;
+        self.check_for_domain_metadata_conflicts()?;
         self.check_for_added_files_that_should_have_been_read_by_current_txn()?;
         self.check_for_deleted_files_against_current_txn_read_files()?;
         self.check_for_deleted_files_against_current_txn_deleted_files()?;
@@ -464,6 +482,30 @@ impl<'a> ConflictChecker<'a> {
         } else {
             Ok(())
         }
+    }
+
+    /// Domain metadata is an application-owned singleton per domain. A writer
+    /// must recompute from the winning domain state instead of overwriting a
+    /// concurrent update based on its stale snapshot.
+    fn check_for_domain_metadata_conflicts(&self) -> Result<(), CommitConflictError> {
+        let current_domains: HashSet<&str> = self
+            .txn_info
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::DomainMetadata(metadata) => Some(metadata.domain.as_str()),
+                _ => None,
+            })
+            .collect();
+        if let Some(domain) = self
+            .winning_commit_summary
+            .domain_metadata_domains()
+            .into_iter()
+            .find(|domain| current_domains.contains(domain.as_str()))
+        {
+            return Err(CommitConflictError::ConcurrentDomainMetadata { domain });
+        }
+        Ok(())
     }
 
     /// Check if the new files added by the already committed transactions

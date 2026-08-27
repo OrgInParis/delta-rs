@@ -95,7 +95,8 @@ use serde::{Deserialize, Serialize};
 use self::conflict_checker::{TransactionInfo, WinningCommitSummary};
 use crate::errors::DeltaTableError;
 use crate::kernel::{
-    Action, CommitInfo, EagerSnapshot, IsolationLevel, Metadata, Protocol, Transaction, Version,
+    Action, CommitInfo, DomainMetadata, EagerSnapshot, IsolationLevel, Metadata, Protocol,
+    Transaction, Version,
 };
 use crate::logstore::ObjectStoreRef;
 use crate::logstore::{CommitOrBytes, LogStore, LogStoreRef, get_actions};
@@ -216,6 +217,13 @@ pub enum TransactionError {
     /// Error returned when table features are required but not specified
     #[error("Table features must be specified, please specify: {0:?}")]
     TableFeaturesRequired(TableFeature),
+
+    /// One commit attempted to reconcile the same metadata domain twice.
+    #[error("The transaction includes more than one action for metadata domain {domain}")]
+    ConflictingDomainMetadata {
+        /// Duplicated domain identifier.
+        domain: String,
+    },
 
     /// Delta-rs cannot safely vacuum a catalog-managed table without catalog maintenance state.
     #[error("VACUUM is not supported for catalog-managed tables")]
@@ -622,6 +630,7 @@ pub struct PostCommitHookProperties {
 pub struct CommitProperties {
     pub(crate) app_metadata: HashMap<String, Value>,
     pub(crate) app_transaction: Vec<Transaction>,
+    domain_metadata: Vec<DomainMetadata>,
     max_retries: usize,
     create_checkpoint: bool,
     cleanup_expired_logs: Option<bool>,
@@ -632,6 +641,7 @@ impl Default for CommitProperties {
         Self {
             app_metadata: Default::default(),
             app_transaction: Vec::new(),
+            domain_metadata: Vec::new(),
             max_retries: DEFAULT_RETRIES,
             create_checkpoint: true,
             cleanup_expired_logs: None,
@@ -673,6 +683,18 @@ impl CommitProperties {
         self
     }
 
+    /// Replace the user-controlled domain metadata actions included in the
+    /// commit.
+    ///
+    /// The target table must advertise the `domainMetadata` writer feature.
+    pub fn with_domain_metadata(
+        mut self,
+        metadata: impl IntoIterator<Item = DomainMetadata>,
+    ) -> Self {
+        self.domain_metadata = metadata.into_iter().collect();
+        self
+    }
+
     /// Specify if it should clean up the logs when the logRetentionDuration interval is met
     pub fn with_cleanup_expired_logs(mut self, cleanup_expired_logs: Option<bool>) -> Self {
         self.cleanup_expired_logs = cleanup_expired_logs;
@@ -690,6 +712,7 @@ impl From<CommitProperties> for CommitBuilder {
                 cleanup_expired_logs: value.cleanup_expired_logs,
             }),
             app_transaction: value.app_transaction,
+            domain_metadata: value.domain_metadata,
             ..Default::default()
         }
     }
@@ -700,6 +723,7 @@ pub struct CommitBuilder {
     actions: Vec<Action>,
     app_metadata: HashMap<String, Value>,
     app_transaction: Vec<Transaction>,
+    domain_metadata: Vec<DomainMetadata>,
     max_retries: usize,
     post_commit_hook: Option<PostCommitHookProperties>,
     post_commit_hook_handler: Option<Arc<dyn CustomExecuteHandler>>,
@@ -712,6 +736,7 @@ impl Default for CommitBuilder {
             actions: Vec::new(),
             app_metadata: HashMap::new(),
             app_transaction: Vec::new(),
+            domain_metadata: Vec::new(),
             max_retries: DEFAULT_RETRIES,
             post_commit_hook: None,
             post_commit_hook_handler: None,
@@ -762,11 +787,13 @@ impl<'a> CommitBuilder {
 
     /// Prepare a Commit operation using the configured builder
     pub fn build(
-        self,
+        mut self,
         table_data: Option<&'a dyn TableReference>,
         log_store: LogStoreRef,
         operation: DeltaOperation,
     ) -> PreCommit<'a> {
+        self.actions
+            .extend(self.domain_metadata.drain(..).map(Action::DomainMetadata));
         let data = CommitData::new(
             self.actions,
             operation,

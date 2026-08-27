@@ -11,7 +11,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use deltalake_core::kernel::transaction::{PROTOCOL, TransactionError};
 use deltalake_core::kernel::{
-    Action, CommitInfo, DomainMetadata, Metadata, Protocol, StructType, Version,
+    Action, CommitInfo, DomainMetadata, Metadata, Protocol, StructType, TableFeatures, Version,
+    protocol_with_table_features,
 };
 use deltalake_core::logstore::object_store::{
     Error as ObjectStoreError, ObjectStore, ObjectStoreExt as _, PutMode, PutOptions,
@@ -44,6 +45,7 @@ const CATALOG_COMMIT_FAILURE: &str = "Unity Catalog managed commit failed";
 const STAGED_COMMITS_DIRECTORY: &str = "_delta_log/_staged_commits";
 const CLUSTERING_DOMAIN: &str = "delta.clustering";
 const ROW_TRACKING_DOMAIN: &str = "delta.rowTracking";
+const SYSTEM_DOMAIN_PREFIX: &str = "delta.";
 
 const CALLER_STORAGE_IDENTITY_OPTIONS: &[&str] = &[
     "AWS_ACCESS_KEY_ID",
@@ -141,8 +143,8 @@ pub enum CatalogManagedError {
     /// The current Delta Catalog wire contract cannot represent clearing a table comment.
     #[error("Delta Catalog 1.0 cannot represent clearing an existing table comment")]
     CommentRemovalUnsupported,
-    /// Unity Catalog's typed API does not support an arbitrary Delta domain.
-    #[error("Delta Catalog 1.0 does not support domain metadata {domain}")]
+    /// Unity Catalog's typed API does not support this system-controlled Delta domain.
+    #[error("Delta Catalog 1.0 does not support system domain metadata {domain}")]
     DomainUnsupported {
         /// Unsupported Delta domain.
         domain: String,
@@ -212,6 +214,7 @@ pub struct ManagedDeltaTableCreate {
     schema: StructType,
     partition_columns: Vec<String>,
     properties: HashMap<String, String>,
+    table_features: Vec<TableFeatures>,
     comment: Option<String>,
 }
 
@@ -230,8 +233,19 @@ impl ManagedDeltaTableCreate {
             schema,
             partition_columns,
             properties,
+            table_features: Vec::new(),
             comment,
         }
+    }
+
+    /// Add features the caller's table contract requires to the same
+    /// version-zero protocol action as Unity Catalog's required features.
+    pub fn with_table_features(
+        mut self,
+        features: impl IntoIterator<Item = TableFeatures>,
+    ) -> Self {
+        self.table_features = features.into_iter().collect();
+        self
     }
 
     /// Three-part catalog reference being created.
@@ -556,7 +570,10 @@ impl UnityCatalog {
         let properties =
             merge_required_properties(&request.properties, &staging.required_properties)
                 .map_err(managed_delta_error)?;
-        let protocol = protocol_from_wire(&staging.required_protocol)?;
+        let protocol = protocol_with_table_features(
+            protocol_from_wire(&staging.required_protocol)?,
+            &request.table_features,
+        );
         PROTOCOL.can_write_to_protocol(&protocol)?;
 
         let initial_credentials = DeltaCredentialsResponse {
@@ -957,8 +974,13 @@ fn append_domain_updates(
         _ => None,
     }) {
         if domain.removed {
-            validate_supported_domain(domain)?;
-            removals.push(domain.domain.clone());
+            if is_catalog_managed_domain(&domain.domain) {
+                removals.push(domain.domain.clone());
+            } else if domain.domain.starts_with(SYSTEM_DOMAIN_PREFIX) {
+                return Err(transaction_error(CatalogManagedError::DomainUnsupported {
+                    domain: domain.domain.clone(),
+                }));
+            }
             continue;
         }
         match domain.domain.as_str() {
@@ -968,11 +990,17 @@ fn append_domain_updates(
             ROW_TRACKING_DOMAIN => {
                 set.row_tracking = Some(parse_domain::<DeltaRowTrackingDomainMetadata>(domain)?);
             }
-            _ => {
+            unsupported if unsupported.starts_with(SYSTEM_DOMAIN_PREFIX) => {
                 return Err(transaction_error(CatalogManagedError::DomainUnsupported {
                     domain: domain.domain.clone(),
                 }));
             }
+            // User-controlled domains live in the ratified Delta action and
+            // are checkpointed by Delta. Unity Catalog's update wire has
+            // typed fields only for the system domains it itself maintains;
+            // duplicating an application domain into catalog properties is
+            // neither required by Delta nor representable by that contract.
+            _ => {}
         }
     }
     if set != DeltaDomainMetadataUpdates::default() {
@@ -984,13 +1012,8 @@ fn append_domain_updates(
     Ok(())
 }
 
-fn validate_supported_domain(domain: &DomainMetadata) -> Result<(), TransactionError> {
-    match domain.domain.as_str() {
-        CLUSTERING_DOMAIN | ROW_TRACKING_DOMAIN => Ok(()),
-        _ => Err(transaction_error(CatalogManagedError::DomainUnsupported {
-            domain: domain.domain.clone(),
-        })),
-    }
+fn is_catalog_managed_domain(domain: &str) -> bool {
+    matches!(domain, CLUSTERING_DOMAIN | ROW_TRACKING_DOMAIN)
 }
 
 fn parse_domain<T: serde::de::DeserializeOwned>(

@@ -832,6 +832,25 @@ impl TableFeatures {
     }
 }
 
+/// Add explicitly requested table features to a protocol action, raising the
+/// protocol versions exactly as the Delta table-feature rules require.
+///
+/// Catalog-managed creation receives a catalog-required protocol before a
+/// table exists, so it cannot use the ordinary `ADD FEATURE` transaction.
+/// This helper lets that creation path merge caller-required features into
+/// the same version-zero protocol action instead of manufacturing a second
+/// setup commit.
+pub fn protocol_with_table_features(protocol: Protocol, features: &[TableFeatures]) -> Protocol {
+    let (reader_features, writer_features): (Vec<Option<TableFeature>>, Vec<Option<TableFeature>>) =
+        features
+            .iter()
+            .map(TableFeatures::to_reader_writer_features)
+            .unzip();
+    protocol
+        .append_reader_features(&reader_features.into_iter().flatten().collect::<Vec<_>>())
+        .append_writer_features(&writer_features.into_iter().flatten().collect::<Vec<_>>())
+}
+
 ///Storage type of deletion vector
 #[derive(Serialize, Deserialize, Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum StorageType {
