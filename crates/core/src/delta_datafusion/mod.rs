@@ -97,6 +97,7 @@ mod find_files;
 pub mod logical;
 pub mod physical;
 pub mod planner;
+mod scoped_object_store;
 mod session;
 pub use session::SessionFallbackPolicy;
 pub(crate) use session::{SessionResolveContext, resolve_session_state};

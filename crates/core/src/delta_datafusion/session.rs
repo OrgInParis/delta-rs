@@ -14,8 +14,8 @@ use datafusion::{
 use url::Url;
 use uuid::Uuid;
 
-use crate::delta_datafusion::engine::AsObjectStoreUrl;
 use crate::delta_datafusion::planner::DeltaPlanner;
+use crate::delta_datafusion::scoped_object_store::ScopedObjectStoreRegistry;
 use crate::errors::{DeltaResult, DeltaTableError};
 use crate::logstore::LogStore;
 
@@ -58,15 +58,9 @@ pub(crate) trait DeltaSessionExt: DataFusionSession {
     /// Ensure the session's `RuntimeEnv` has the object store registered for the log store's
     /// root URL.
     ///
-    /// This method is idempotent and will not overwrite an existing object store mapping for the
-    /// URL.
-    ///
-    /// Note: this is a best-effort "check then register" helper and is not atomic. Concurrent
-    /// callers may race and register the same mapping multiple times (typically benign).
-    ///
-    /// If the session already has a (stale/incorrect) object store registered for the URL, this
-    /// method will not replace it; callers must explicitly override the mapping via
-    /// `RuntimeEnv::register_object_store`.
+    /// Delta-created sessions retain separate stores for separate table paths, including when
+    /// those paths share one object-store origin. Re-registering the same table path refreshes
+    /// that path's store without changing any sibling table registration.
     fn ensure_object_store_registered(
         &self,
         log_store: &dyn LogStore,
@@ -107,11 +101,10 @@ where
         log_store: &dyn LogStore,
         operation_id: Option<Uuid>,
     ) -> DeltaResult<()> {
-        let url = log_store.root_url().as_object_store_url();
-        if self.runtime_env().object_store(&url).is_err() {
-            self.runtime_env()
-                .register_object_store(url.as_ref(), log_store.root_object_store(operation_id));
-        }
+        self.runtime_env().register_object_store(
+            log_store.root_url(),
+            log_store.root_object_store(operation_id),
+        );
         Ok(())
     }
 }
@@ -300,7 +293,6 @@ impl From<DeltaSessionConfig> for SessionConfig {
 }
 
 /// A builder for configuring DataFusion RuntimeEnv with Delta-specific defaults
-#[derive(Default)]
 pub struct DeltaRuntimeEnvBuilder {
     inner: RuntimeEnvBuilder,
 }
@@ -309,7 +301,8 @@ impl DeltaRuntimeEnvBuilder {
     /// Create a new builder with DataFusion's default runtime settings.
     pub fn new() -> Self {
         Self {
-            inner: RuntimeEnvBuilder::new(),
+            inner: RuntimeEnvBuilder::new()
+                .with_object_store_registry(Arc::new(ScopedObjectStoreRegistry::default())),
         }
     }
 
@@ -334,6 +327,12 @@ impl DeltaRuntimeEnvBuilder {
     }
 }
 
+impl Default for DeltaRuntimeEnvBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A wrapper for DataFusion's SessionContext with Delta-specific defaults
 ///
 /// This provides a way of creating DataFusion sessions with consistent
@@ -346,7 +345,7 @@ impl DeltaSessionContext {
     /// Create a new DeltaSessionContext with default configuration
     pub fn new() -> Self {
         let config = DeltaSessionConfig::default().into();
-        let runtime_env = RuntimeEnvBuilder::new().build_arc().unwrap();
+        let runtime_env = DeltaRuntimeEnvBuilder::new().build();
         Self::new_with_config_and_runtime(config, runtime_env)
     }
 
@@ -398,6 +397,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::delta_datafusion::engine::AsObjectStoreUrl;
     use crate::test_utils::datafusion::{WrapperSession, make_test_scalar_udf};
 
     const TEST_UDF_NAME: &str = "delta_rs_test_udf";

@@ -471,10 +471,17 @@ impl CatalogManagedLogStore {
         for commit in state.catalog_state.commits() {
             let staged = Self::staged_path(commit.file_name()).map_err(transaction_error)?;
             let published = commit_uri_from_version(Some(commit.version()));
-            match store.copy_if_not_exists(&staged, &published).await {
-                Ok(()) => {}
+            let staged_bytes = store.get(&staged).await?.bytes().await?;
+            let options = PutOptions {
+                mode: PutMode::Create,
+                ..PutOptions::default()
+            };
+            match store
+                .put_opts(&published, staged_bytes.clone().into(), options)
+                .await
+            {
+                Ok(_) => {}
                 Err(ObjectStoreError::AlreadyExists { .. }) => {
-                    let staged_bytes = store.get(&staged).await?.bytes().await?;
                     let published_bytes = store.get(&published).await?.bytes().await?;
                     if staged_bytes != published_bytes {
                         return Err(transaction_error(CatalogManagedError::InvalidCommitPayload));
