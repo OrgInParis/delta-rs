@@ -1024,6 +1024,14 @@ impl LogStoreFactory for UnityCatalogFactory {
 
 /// Register an [ObjectStoreFactory] for common UnityCatalogFactory [Url] schemes
 pub fn register_handlers(_additional_prefixes: Option<Url>) {
+    // A catalog-managed table delegates object and log I/O to the native
+    // backend for the location UC returns. Register that dependency before
+    // publishing the uc:// factory: LogStoreFactory::with_options is invoked
+    // while delta-rs holds a read guard on the factory map, so attempting this
+    // write registration from inside that callback self-deadlocks.
+    #[cfg(feature = "aws")]
+    deltalake_aws::register_handlers(None);
+
     let factory = Arc::new(UnityCatalogFactory::default());
     let url = Url::parse("uc://").unwrap();
     object_store_factories().insert(url.clone(), factory.clone());

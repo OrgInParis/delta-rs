@@ -176,6 +176,10 @@ pub enum TransactionError {
     #[error("Tried committing existing table version: {0}")]
     VersionAlreadyExists(Version),
 
+    /// A strict initial commit was incorrectly given an existing table snapshot.
+    #[error("A strict initial commit requires an uninitialized table")]
+    StrictInitialCommitWithTableState,
+
     /// Error returned when reading the delta log object failed.
     #[error("Error serializing commit log to json: {json_err}")]
     SerializeLogJson {
@@ -925,6 +929,51 @@ impl PreparedCommit<'_> {
     pub fn commit_or_bytes(&self) -> &CommitOrBytes {
         &self.commit_or_bytes
     }
+
+    /// Commit version zero exactly once, without conflict retry or snapshot loading.
+    ///
+    /// Catalog protocols use this when the catalog must ratify version zero before a readable
+    /// table state exists. A concurrent version zero is returned as `VersionAlreadyExists`; it is
+    /// never reinterpreted as permission to append the create actions at version one.
+    pub(crate) async fn commit_initial_without_retry(self) -> DeltaResult<PostCommit> {
+        let PreparedCommit {
+            commit_or_bytes,
+            log_store,
+            data,
+            table_data,
+            post_commit_hook_handler,
+            operation_id,
+            ..
+        } = self;
+        if table_data.is_some() {
+            return Err(TransactionError::StrictInitialCommitWithTableState.into());
+        }
+        log_store
+            .write_commit_entry(0, commit_or_bytes, operation_id)
+            .await?;
+        Ok(initial_post_commit(
+            data,
+            log_store,
+            post_commit_hook_handler,
+        ))
+    }
+}
+
+fn initial_post_commit(
+    data: CommitData,
+    log_store: LogStoreRef,
+    custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
+) -> PostCommit {
+    PostCommit {
+        version: 0,
+        data,
+        create_checkpoint: false,
+        cleanup_expired_logs: None,
+        log_store,
+        table_data: None,
+        custom_execute_handler,
+        metrics: CommitMetrics { num_retries: 0 },
+    }
 }
 
 impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
@@ -950,16 +999,11 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
                     .await
                 {
                     Ok(_) => {
-                        return Ok(PostCommit {
-                            version: 0,
-                            data: this.data,
-                            create_checkpoint: false,
-                            cleanup_expired_logs: None,
-                            log_store: this.log_store,
-                            table_data: None,
-                            custom_execute_handler: this.post_commit_hook_handler,
-                            metrics: CommitMetrics { num_retries: 0 },
-                        });
+                        return Ok(initial_post_commit(
+                            this.data,
+                            this.log_store,
+                            this.post_commit_hook_handler,
+                        ));
                     }
                     Err(TransactionError::VersionAlreadyExists(0)) => {
                         // Table was created by another writer since the `this.table_data.is_none()` check.

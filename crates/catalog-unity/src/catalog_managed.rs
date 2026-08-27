@@ -598,17 +598,16 @@ impl UnityCatalog {
         if let Some(comment) = &request.comment {
             create = create.with_comment(comment.clone());
         }
-        let created = create.await?;
-        let snapshot = created.snapshot()?;
+        let created = create.commit_new_table_without_load().await?;
         let create_request = DeltaCreateTableRequest {
             name: request.table.table().to_owned(),
             location: staging.location.clone(),
             table_type: DeltaTableType::Managed,
             comment: request.comment,
-            columns: serde_json::to_value(snapshot.schema())?,
-            partition_columns: snapshot.metadata().partition_columns().to_vec(),
-            protocol: protocol_to_wire(snapshot.protocol()),
-            properties: snapshot.metadata().configuration().clone(),
+            columns: created.metadata().parse_schema()?.into(),
+            partition_columns: created.metadata().partition_columns().to_vec(),
+            protocol: protocol_to_wire(created.protocol()),
+            properties: created.metadata().configuration().clone(),
             last_commit_timestamp_ms: timestamp,
         };
         let finalized = match self
@@ -904,8 +903,7 @@ fn append_metadata_updates(
         .ok_or_else(|| transaction_error(CatalogManagedError::PreviousMetadataMissing))?;
     let schema = metadata.parse_schema().map_err(transaction_error)?;
     updates.push(DeltaTableUpdate::SetColumns {
-        columns: serde_json::to_value(schema)
-            .map_err(|source| TransactionError::SerializeLogJson { json_err: source })?,
+        columns: schema.into(),
     });
     updates.push(DeltaTableUpdate::SetPartitionColumns {
         partition_columns: metadata.partition_columns().to_vec(),
@@ -1153,9 +1151,6 @@ fn native_log_store(
     let mut storage_options = transport_storage_options(storage_config)?;
     storage_options.extend(vended_options.clone());
 
-    #[cfg(feature = "aws")]
-    deltalake_aws::register_handlers(None);
-
     let location = ensure_table_uri(location)?;
     let mut native_builder = DeltaTableBuilder::from_url(location)?;
     if let Some(runtime) = &storage_config.runtime {
@@ -1207,6 +1202,22 @@ pub(crate) async fn build_catalog_managed_log_store(
 mod tests {
     use super::*;
     use deltalake_core::kernel::{DataType, Protocol, StructField, new_metadata};
+
+    #[cfg(feature = "aws")]
+    #[test]
+    fn unity_registration_installs_native_s3_handlers_before_factory_use() {
+        crate::register_handlers(None);
+        let s3 = Url::parse("s3://").expect("the native S3 scheme is valid");
+
+        assert!(
+            deltalake_core::logstore::object_store_factories().contains_key(&s3),
+            "the native S3 object-store factory must precede the UC factory callback"
+        );
+        assert!(
+            deltalake_core::logstore::logstore_factories().contains_key(&s3),
+            "the native S3 log-store factory must precede the UC factory callback"
+        );
+    }
 
     #[test]
     fn protocol_conversion_preserves_versions_and_features() {

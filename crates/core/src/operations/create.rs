@@ -14,8 +14,8 @@ use super::{CustomExecuteHandler, Operation};
 use crate::errors::{ColumnMappingOperation, DeltaResult, DeltaTableError};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties, PROTOCOL, TableReference};
 use crate::kernel::{
-    Action, DataType, MetadataExt, ProtocolExt as _, ProtocolInner, StructField, StructType,
-    new_metadata,
+    Action, DataType, Metadata, MetadataExt, Protocol, ProtocolExt as _, ProtocolInner,
+    StructField, StructType, Version, new_metadata,
 };
 use crate::logstore::LogStoreRef;
 use crate::protocol::{DeltaOperation, SaveMode};
@@ -40,6 +40,15 @@ enum CreateError {
 
     #[error("SaveMode `append` is not allowed for create operation.")]
     AppendNotAllowed,
+
+    #[error("An unloaded create commit requires SaveMode `error_if_exists`.")]
+    UnloadedCommitRequiresErrorIfExists,
+
+    #[error("An unloaded create commit cannot run a custom execute handler.")]
+    UnloadedCommitWithExecuteHandler,
+
+    #[error("An unloaded create commit produced version {actual}; expected version 0.")]
+    UnloadedCommitVersion { actual: Version },
 }
 
 impl From<CreateError> for DeltaTableError {
@@ -91,6 +100,36 @@ pub struct CreateBuilder {
     commit_properties: CommitProperties,
     raise_if_key_not_exists: bool,
     custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
+}
+
+/// A newly committed table whose snapshot has intentionally not been loaded.
+///
+/// This result is for catalog protocols that must ratify version zero before the table can be
+/// loaded. It exposes only the committed metadata and protocol required for ratification; the
+/// provisional table cannot escape before the catalog integration reopens it through its
+/// coordinated log store.
+#[derive(Debug)]
+pub struct UnloadedCreate {
+    version: Version,
+    metadata: Metadata,
+    protocol: Protocol,
+}
+
+impl UnloadedCreate {
+    /// The committed Delta version.
+    pub fn version(&self) -> Version {
+        self.version
+    }
+
+    /// The exact metadata action committed at version zero.
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    /// The exact protocol action committed at version zero.
+    pub fn protocol(&self) -> &Protocol {
+        &self.protocol
+    }
 }
 
 impl super::Operation for CreateBuilder {
@@ -380,6 +419,90 @@ impl CreateBuilder {
 
         Ok((table, actions, operation, operation_id))
     }
+
+    /// Commit a new table without loading its snapshot.
+    ///
+    /// Catalog-managed protocols use this seam when version zero must be written before the
+    /// catalog can ratify the table and expose the coordinated log state required for loading.
+    /// This operation accepts only `ErrorIfExists`; replacement and existing-table modes require
+    /// a loaded snapshot and therefore remain on the normal [`IntoFuture`](std::future::IntoFuture)
+    /// path.
+    pub async fn commit_new_table_without_load(self) -> DeltaResult<UnloadedCreate> {
+        if !matches!(self.mode, SaveMode::ErrorIfExists) {
+            return Err(CreateError::UnloadedCommitRequiresErrorIfExists.into());
+        }
+        if self.custom_execute_handler.is_some() {
+            return Err(CreateError::UnloadedCommitWithExecuteHandler.into());
+        }
+
+        let commit_properties = self.commit_properties.clone();
+        let (table, actions, operation, operation_id) = self.into_table_and_actions().await?;
+        if table.log_store.is_delta_table_location().await? {
+            return Err(CreateError::TableAlreadyExists.into());
+        }
+        let (metadata, protocol) = match &operation {
+            DeltaOperation::Create {
+                metadata, protocol, ..
+            } => (metadata.clone(), protocol.clone()),
+            _ => unreachable!("CreateBuilder always produces DeltaOperation::Create"),
+        };
+        let version = commit_initial_create_actions_without_load(
+            commit_properties,
+            actions,
+            operation_id,
+            table.log_store.clone(),
+            operation,
+        )
+        .await?;
+
+        Ok(UnloadedCreate {
+            version,
+            metadata,
+            protocol,
+        })
+    }
+}
+
+async fn commit_initial_create_actions_without_load(
+    commit_properties: CommitProperties,
+    actions: Vec<Action>,
+    operation_id: Uuid,
+    log_store: LogStoreRef,
+    operation: DeltaOperation,
+) -> DeltaResult<Version> {
+    let post_commit = CommitBuilder::from(commit_properties)
+        .with_actions(actions)
+        .with_operation_id(operation_id)
+        .build(None, log_store, operation)
+        .into_prepared_commit_future()
+        .await?
+        .commit_initial_without_retry()
+        .await?;
+    if post_commit.version != 0 {
+        return Err(CreateError::UnloadedCommitVersion {
+            actual: post_commit.version,
+        }
+        .into());
+    }
+    Ok(post_commit.version)
+}
+
+async fn commit_create_actions(
+    commit_properties: CommitProperties,
+    actions: Vec<Action>,
+    operation_id: Uuid,
+    handler: Option<Arc<dyn CustomExecuteHandler>>,
+    table_state: Option<&dyn TableReference>,
+    log_store: LogStoreRef,
+    operation: DeltaOperation,
+) -> DeltaResult<Version> {
+    Ok(CommitBuilder::from(commit_properties)
+        .with_actions(actions)
+        .with_operation_id(operation_id)
+        .with_post_commit_hook_handler(handler)
+        .build(table_state, log_store, operation)
+        .await?
+        .version())
 }
 
 impl std::future::IntoFuture for CreateBuilder {
@@ -419,17 +542,16 @@ impl std::future::IntoFuture for CreateBuilder {
                 None
             };
 
-            let version = CommitBuilder::from(this.commit_properties.clone())
-                .with_actions(actions)
-                .with_operation_id(operation_id)
-                .with_post_commit_hook_handler(handler.clone())
-                .build(
-                    table_state.map(|f| f as &dyn TableReference),
-                    table.log_store.clone(),
-                    operation,
-                )
-                .await?
-                .version();
+            let version = commit_create_actions(
+                this.commit_properties.clone(),
+                actions,
+                operation_id,
+                handler.clone(),
+                table_state.map(|state| state as &dyn TableReference),
+                table.log_store.clone(),
+                operation,
+            )
+            .await?;
             table.load_version(version).await?;
 
             if let Some(handler) = handler {
@@ -462,6 +584,75 @@ mod tests {
             .unwrap();
         assert_eq!(table.version(), Some(0));
         assert_eq!(table.snapshot().unwrap().schema().as_ref(), &table_schema)
+    }
+
+    #[tokio::test]
+    async fn catalog_managed_creation_can_defer_snapshot_loading() {
+        let schema = get_delta_schema();
+        let protocol: Protocol = serde_json::from_value(serde_json::json!({
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": ["catalogManaged"],
+            "writerFeatures": ["catalogManaged", "inCommitTimestamp"]
+        }))
+        .unwrap();
+        let created = CreateBuilder::new()
+            .with_location("memory:///catalog-managed-deferred-create")
+            .with_columns(schema.fields().cloned())
+            .with_actions([Action::Protocol(protocol.clone())])
+            .commit_new_table_without_load()
+            .await
+            .unwrap();
+
+        assert_eq!(created.version(), 0);
+        assert_eq!(created.protocol().min_reader_version(), 3);
+        assert_eq!(created.protocol().min_writer_version(), 7);
+        assert!(
+            created
+                .protocol()
+                .reader_features()
+                .is_some_and(|features| features.contains(&TableFeature::CatalogManaged))
+        );
+        assert!(
+            created
+                .protocol()
+                .writer_features()
+                .is_some_and(|features| {
+                    features.contains(&TableFeature::CatalogManaged)
+                        && features.contains(&TableFeature::InCommitTimestamp)
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_creation_never_retries_version_zero_as_version_one() {
+        let schema = get_delta_schema();
+        let existing = DeltaTable::new_in_memory()
+            .create()
+            .with_columns(schema.fields().cloned())
+            .await
+            .unwrap();
+        let log_store = existing.log_store();
+        let create = CreateBuilder::new()
+            .with_log_store(log_store.clone())
+            .with_columns(schema.fields().cloned());
+        let commit_properties = create.commit_properties.clone();
+        let (table, actions, operation, operation_id) =
+            create.into_table_and_actions().await.unwrap();
+        let prepared = CommitBuilder::from(commit_properties)
+            .with_actions(actions)
+            .with_operation_id(operation_id)
+            .build(None, table.log_store.clone(), operation)
+            .into_prepared_commit_future()
+            .await
+            .unwrap();
+
+        let error = match prepared.commit_initial_without_retry().await {
+            Ok(_) => panic!("an existing version zero must refuse without retry"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, DeltaTableError::VersionAlreadyExists(0)));
+        assert_eq!(log_store.get_latest_version(0).await.unwrap(), 0);
     }
 
     #[tokio::test]

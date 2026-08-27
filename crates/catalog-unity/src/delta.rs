@@ -10,10 +10,13 @@ use std::fmt;
 use std::str::FromStr;
 
 use chrono::Utc;
+use deltalake_core::kernel::{
+    DataType, MetadataValue, StructField, StructType as KernelStructType,
+};
 use reqwest::Url;
 use reqwest::header::AUTHORIZATION;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 use crate::{UnityCatalog, UnityCatalogError};
 
@@ -94,11 +97,10 @@ pub struct DeltaTableReference {
 impl DeltaTableReference {
     /// Parse `uc://catalog.schema.table` without applying catalog naming policy locally.
     pub fn try_from_uri(table_uri: &str) -> Result<Self, UnityCatalogError> {
-        let parsed = Url::parse(table_uri).map_err(|_| {
-            UnityCatalogError::InvalidDeltaTableReference {
+        let parsed =
+            Url::parse(table_uri).map_err(|_| UnityCatalogError::InvalidDeltaTableReference {
                 table_uri: table_uri.to_owned(),
-            }
-        })?;
+            })?;
         if parsed.scheme() != "uc"
             || !parsed.username().is_empty()
             || parsed.password().is_some()
@@ -111,11 +113,12 @@ impl DeltaTableReference {
                 table_uri: table_uri.to_owned(),
             });
         }
-        let qualified_name = parsed.host_str().ok_or_else(|| {
-            UnityCatalogError::InvalidDeltaTableReference {
-                table_uri: table_uri.to_owned(),
-            }
-        })?;
+        let qualified_name =
+            parsed
+                .host_str()
+                .ok_or_else(|| UnityCatalogError::InvalidDeltaTableReference {
+                    table_uri: table_uri.to_owned(),
+                })?;
         let parts: Vec<&str> = qualified_name.split('.').collect();
         if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
             return Err(UnityCatalogError::InvalidDeltaTableReference {
@@ -429,8 +432,8 @@ pub struct DeltaCreateTableRequest {
     /// Optional table comment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
-    /// Delta schema JSON object.
-    pub columns: serde_json::Value,
+    /// Validated Delta schema serialized in the Delta Catalog wire representation.
+    pub columns: DeltaStructType,
     /// Logical partition columns.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub partition_columns: Vec<String>,
@@ -440,6 +443,119 @@ pub struct DeltaCreateTableRequest {
     pub properties: HashMap<String, String>,
     /// Version-zero in-commit timestamp.
     pub last_commit_timestamp_ms: i64,
+}
+
+/// A validated kernel schema viewed through the Delta Catalog wire representation.
+///
+/// Delta kernel retains the logical schema and validation rules. This wrapper changes only the
+/// JSON member names for complex types from Delta log camelCase to the catalog API's kebab-case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaStructType(KernelStructType);
+
+impl From<KernelStructType> for DeltaStructType {
+    fn from(schema: KernelStructType) -> Self {
+        Self(schema)
+    }
+}
+
+impl Serialize for DeltaStructType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        DeltaStructTypeWire(&self.0).serialize(serializer)
+    }
+}
+
+struct DeltaStructTypeWire<'a>(&'a KernelStructType);
+
+impl Serialize for DeltaStructTypeWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        DeltaStructTypeObject {
+            type_name: "struct",
+            fields: self.0.fields().map(DeltaStructFieldWire::from).collect(),
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Serialize)]
+struct DeltaStructTypeObject<'a> {
+    #[serde(rename = "type")]
+    type_name: &'static str,
+    fields: Vec<DeltaStructFieldWire<'a>>,
+}
+
+#[derive(Serialize)]
+struct DeltaStructFieldWire<'a> {
+    name: &'a str,
+    #[serde(rename = "type")]
+    data_type: DeltaDataTypeWire<'a>,
+    nullable: bool,
+    metadata: &'a HashMap<String, MetadataValue>,
+}
+
+impl<'a> From<&'a StructField> for DeltaStructFieldWire<'a> {
+    fn from(field: &'a StructField) -> Self {
+        Self {
+            name: &field.name,
+            data_type: DeltaDataTypeWire(field.data_type()),
+            nullable: field.nullable,
+            metadata: &field.metadata,
+        }
+    }
+}
+
+struct DeltaDataTypeWire<'a>(&'a DataType);
+
+impl Serialize for DeltaDataTypeWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self.0 {
+            DataType::Primitive(_) | DataType::Variant(_) => self.0.serialize(serializer),
+            DataType::Array(array) => DeltaArrayTypeWire {
+                type_name: "array",
+                element_type: DeltaDataTypeWire(array.element_type()),
+                contains_null: array.contains_null(),
+            }
+            .serialize(serializer),
+            DataType::Struct(schema) => DeltaStructTypeWire(schema).serialize(serializer),
+            DataType::Map(map) => DeltaMapTypeWire {
+                type_name: "map",
+                key_type: DeltaDataTypeWire(map.key_type()),
+                value_type: DeltaDataTypeWire(map.value_type()),
+                value_contains_null: map.value_contains_null(),
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct DeltaArrayTypeWire<'a> {
+    #[serde(rename = "type")]
+    type_name: &'static str,
+    #[serde(rename = "element-type")]
+    element_type: DeltaDataTypeWire<'a>,
+    #[serde(rename = "contains-null")]
+    contains_null: bool,
+}
+
+#[derive(Serialize)]
+struct DeltaMapTypeWire<'a> {
+    #[serde(rename = "type")]
+    type_name: &'static str,
+    #[serde(rename = "key-type")]
+    key_type: DeltaDataTypeWire<'a>,
+    #[serde(rename = "value-type")]
+    value_type: DeltaDataTypeWire<'a>,
+    #[serde(rename = "value-contains-null")]
+    value_contains_null: bool,
 }
 
 /// Optimistic precondition attached to a table update.
@@ -506,8 +622,8 @@ pub enum DeltaTableUpdate {
     /// Replace the schema.
     #[serde(rename = "set-columns")]
     SetColumns {
-        /// Delta schema JSON object.
-        columns: serde_json::Value,
+        /// Validated Delta schema in the Delta Catalog wire representation.
+        columns: DeltaStructType,
     },
     /// Replace the table comment.
     #[serde(rename = "set-table-comment")]
@@ -797,6 +913,7 @@ async fn decode_delta_response<T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deltalake_core::kernel::{ArrayType, MapType};
 
     fn credential(
         prefix: &str,
@@ -824,6 +941,37 @@ mod tests {
         assert!(DeltaTableReference::try_from_uri("uc://catalog..table").is_err());
         assert!(DeltaTableReference::try_from_uri("uc://catalog.schema.table/path").is_err());
         assert!(DeltaTableReference::try_from_uri("uc://catalog.schema.table?query=1").is_err());
+    }
+
+    #[test]
+    fn catalog_schema_serializes_complex_types_with_kebab_case_members() {
+        let schema = KernelStructType::try_new([StructField::new(
+            "nested",
+            ArrayType::new(MapType::new(DataType::STRING, DataType::LONG, true), false),
+            true,
+        )])
+        .expect("valid nested Delta schema");
+        let wire = serde_json::to_value(DeltaStructType::from(schema.clone()))
+            .expect("catalog schema is serializable");
+        let array = &wire["fields"][0]["type"];
+        let map = &array["element-type"];
+
+        assert_eq!(array["type"], "array");
+        assert_eq!(array["contains-null"], false);
+        assert!(array.get("elementType").is_none());
+        assert_eq!(map["type"], "map");
+        assert_eq!(map["key-type"], "string");
+        assert_eq!(map["value-type"], "long");
+        assert_eq!(map["value-contains-null"], true);
+        assert!(map.get("valueContainsNull").is_none());
+
+        let update = serde_json::to_value(DeltaTableUpdate::SetColumns {
+            columns: schema.into(),
+        })
+        .expect("catalog schema update is serializable");
+        let updated_array = &update["columns"]["fields"][0]["type"];
+        assert!(updated_array.get("element-type").is_some());
+        assert!(updated_array.get("elementType").is_none());
     }
 
     #[test]
