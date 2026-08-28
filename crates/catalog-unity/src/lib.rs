@@ -26,9 +26,9 @@ use crate::credential::{
     WorkspaceOAuthProvider,
 };
 use crate::models::{
-    ErrorResponse, GetSchemaResponse, GetTableResponse, ListCatalogsResponse, ListSchemasResponse,
-    ListTableSummariesResponse, Table, TableTempCredentialsResponse, TableType,
-    TemporaryTableCredentialsRequest, TokenErrorResponse,
+    CreateSchemaRequest, CreateSchemaResponse, ErrorResponse, GetSchemaResponse, GetTableResponse,
+    ListCatalogsResponse, ListSchemasResponse, ListTableSummariesResponse, Table,
+    TableTempCredentialsResponse, TableType, TemporaryTableCredentialsRequest, TokenErrorResponse,
 };
 
 use deltalake_core::data_catalog::DataCatalogResult;
@@ -850,6 +850,31 @@ impl UnityCatalog {
         Ok(resp.json().await?)
     }
 
+    /// Creates a schema in a catalog through Unity Catalog's native schema API.
+    ///
+    /// Unity Catalog performs ownership assignment and authorization. This
+    /// client neither derives an owner nor interprets grants.
+    #[instrument(skip(self))]
+    pub async fn create_schema(
+        &self,
+        request: &CreateSchemaRequest,
+    ) -> Result<CreateSchemaResponse, UnityCatalogError> {
+        tracing::event!(
+            tracing::Level::DEBUG,
+            "Creating schema: {}",
+            self.catalog_url()
+        );
+        let token = self.get_credential().await?;
+        let resp = self
+            .client
+            .post(format!("{}/schemas", self.catalog_url()))
+            .header(AUTHORIZATION, token)
+            .json(request)
+            .send()
+            .await?;
+        Ok(resp.json().await?)
+    }
+
     /// Gets an array of summaries for tables for a schema and catalog within the metastore.
     ///
     /// The table summaries returned are either:
@@ -1122,6 +1147,19 @@ mod tests {
             })
             .await;
 
+        let create_schema = server
+            .mock_async(|when, then| {
+                when.path("/api/2.1/unity-catalog/schemas")
+                    .method("POST")
+                    .json_body_obj(&serde_json::json!({
+                        "name": "schema_name",
+                        "catalog_name": "catalog_name",
+                        "comment": "ATP plateau namespace"
+                    }));
+                then.body(GET_SCHEMA_RESPONSE);
+            })
+            .await;
+
         server
             .mock_async(|when, then| {
                 when.path("/api/2.1/unity-catalog/tables/catalog_name.schema_name.table_name")
@@ -1141,6 +1179,21 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(get_schema_response, GetSchemaResponse::Success(_)));
+
+        let create_schema_response = client
+            .create_schema(&CreateSchemaRequest {
+                name: "schema_name".to_owned(),
+                catalog_name: "catalog_name".to_owned(),
+                comment: Some("ATP plateau namespace".to_owned()),
+                properties: HashMap::new(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            create_schema_response,
+            CreateSchemaResponse::Success(_)
+        ));
+        create_schema.assert_async().await;
 
         let get_table_response = client
             .get_table("catalog_name", "schema_name", "table_name")

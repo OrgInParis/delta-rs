@@ -104,6 +104,31 @@ pub enum GetSchemaResponse {
     Error(ErrorResponse),
 }
 
+/// Create schema request
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct CreateSchemaRequest {
+    /// Name of the schema relative to its parent catalog.
+    pub name: String,
+    /// Name of the parent catalog.
+    pub catalog_name: String,
+    /// User-provided description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// Properties attached to the schema securable.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub properties: HashMap<String, String>,
+}
+
+/// Create schema response
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+pub enum CreateSchemaResponse {
+    /// Successful response
+    Success(Box<Schema>),
+    /// Error response
+    Error(ErrorResponse),
+}
+
 /// List table summaries response
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
@@ -214,6 +239,10 @@ pub struct EffectivePredictiveOptimizationFlag {
 /// A schema within a catalog
 #[derive(Deserialize, Default, Debug)]
 pub struct Schema {
+    /// Stable Unity Catalog identifier for this schema securable.
+    #[serde(default)]
+    pub schema_id: String,
+
     /// Username of schema creator.
     #[serde(default)]
     pub created_by: String,
