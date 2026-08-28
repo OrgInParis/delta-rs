@@ -13,7 +13,7 @@ use deltalake_core::logstore::{
 };
 use reqwest::Url;
 use reqwest::header::{AUTHORIZATION, HeaderValue, InvalidHeaderValue};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::future::Future;
 use std::str::FromStr;
@@ -126,6 +126,15 @@ pub enum UnityCatalogError {
     InvalidDeltaAccessIntent {
         /// Rejected value, or `missing` when the option was absent.
         actual: String,
+    },
+
+    /// A paginated Unity Catalog endpoint repeated a continuation token.
+    #[error("Unity Catalog pagination for {endpoint} repeated token {page_token}")]
+    PaginationCycle {
+        /// Endpoint whose continuation contract was violated.
+        endpoint: &'static str,
+        /// Repeated opaque continuation token.
+        page_token: String,
     },
 
     /// Request returned error response
@@ -769,18 +778,57 @@ impl UnityCatalog {
     /// There is no guarantee of a specific ordering of the elements in the array.
     #[instrument(skip(self))]
     pub async fn list_catalogs(&self) -> Result<ListCatalogsResponse, UnityCatalogError> {
+        let mut catalogs = Vec::new();
+        let mut page_token: Option<String> = None;
+        let mut seen_tokens: HashSet<String> = HashSet::new();
+        loop {
+            match self.list_catalogs_page(page_token.as_deref()).await? {
+                ListCatalogsResponse::Success {
+                    catalogs: page,
+                    next_page_token,
+                } => {
+                    catalogs.extend(page);
+                    let Some(next_page_token) = next_page_token.filter(|token| !token.is_empty())
+                    else {
+                        break;
+                    };
+                    if !seen_tokens.insert(next_page_token.clone()) {
+                        return Err(UnityCatalogError::PaginationCycle {
+                            endpoint: "catalogs",
+                            page_token: next_page_token,
+                        });
+                    }
+                    page_token = Some(next_page_token);
+                }
+                ListCatalogsResponse::Error(error) => {
+                    return Ok(ListCatalogsResponse::Error(error));
+                }
+            }
+        }
+        Ok(ListCatalogsResponse::Success {
+            catalogs,
+            next_page_token: None,
+        })
+    }
+
+    async fn list_catalogs_page(
+        &self,
+        page_token: Option<&str>,
+    ) -> Result<ListCatalogsResponse, UnityCatalogError> {
         tracing::event!(
             tracing::Level::DEBUG,
             "Listing catalogs: {}",
             self.catalog_url()
         );
         let token = self.get_credential().await?;
-        let resp = self
+        let mut request = self
             .client
             .get(format!("{}/catalogs", self.catalog_url()))
-            .header(AUTHORIZATION, token)
-            .send()
-            .await?;
+            .header(AUTHORIZATION, token);
+        if let Some(page_token) = page_token {
+            request = request.query(&[("page_token", page_token)]);
+        }
+        let resp = request.send().await?;
         Ok(resp.json().await?)
     }
 
@@ -801,19 +849,63 @@ impl UnityCatalog {
     where
         S: Into<String> + Debug,
     {
+        let catalog_name = catalog_name.into();
+        let mut schemas = Vec::new();
+        let mut page_token: Option<String> = None;
+        let mut seen_tokens: HashSet<String> = HashSet::new();
+        loop {
+            match self
+                .list_schemas_page(&catalog_name, page_token.as_deref())
+                .await?
+            {
+                ListSchemasResponse::Success {
+                    schemas: page,
+                    next_page_token,
+                } => {
+                    schemas.extend(page);
+                    let Some(next_page_token) = next_page_token.filter(|token| !token.is_empty())
+                    else {
+                        break;
+                    };
+                    if !seen_tokens.insert(next_page_token.clone()) {
+                        return Err(UnityCatalogError::PaginationCycle {
+                            endpoint: "schemas",
+                            page_token: next_page_token,
+                        });
+                    }
+                    page_token = Some(next_page_token);
+                }
+                ListSchemasResponse::Error(error) => {
+                    return Ok(ListSchemasResponse::Error(error));
+                }
+            }
+        }
+        Ok(ListSchemasResponse::Success {
+            schemas,
+            next_page_token: None,
+        })
+    }
+
+    async fn list_schemas_page(
+        &self,
+        catalog_name: &str,
+        page_token: Option<&str>,
+    ) -> Result<ListSchemasResponse, UnityCatalogError> {
         tracing::event!(
             tracing::Level::DEBUG,
             "Listing schemas: {}",
             self.catalog_url()
         );
         let token = self.get_credential().await?;
-        let resp = self
+        let mut request = self
             .client
             .get(format!("{}/schemas", self.catalog_url()))
             .header(AUTHORIZATION, token)
-            .query(&[("catalog_name", catalog_name.into())])
-            .send()
-            .await?;
+            .query(&[("catalog_name", catalog_name)]);
+        if let Some(page_token) = page_token {
+            request = request.query(&[("page_token", page_token)]);
+        }
+        let resp = request.send().await?;
         Ok(resp.json().await?)
     }
 

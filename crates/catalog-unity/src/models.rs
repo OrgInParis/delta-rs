@@ -79,6 +79,9 @@ pub enum ListSchemasResponse {
     Success {
         /// The schemas within the parent catalog
         schemas: Vec<Schema>,
+        /// Opaque continuation token for the next page, when one exists.
+        #[serde(default)]
+        next_page_token: Option<String>,
     },
     /// Error response
     Error(ErrorResponse),

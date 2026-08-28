@@ -80,7 +80,7 @@ impl UnityCatalogProvider {
     ) -> DataCatalogResult<Self> {
         let catalog_name = catalog_name.into();
         let schemas = match client.list_schemas(&catalog_name).await? {
-            ListSchemasResponse::Success { schemas } => {
+            ListSchemasResponse::Success { schemas, .. } => {
                 let mut providers = Vec::new();
                 for schema in schemas {
                     let provider =
