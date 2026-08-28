@@ -185,20 +185,20 @@ pub enum CatalogType {
 #[derive(Deserialize, Default, Debug)]
 #[serde(default)]
 pub struct Catalog {
-    pub created_by: String,
+    pub created_by: Option<String>,
     pub name: String,
-    pub updated_by: String,
+    pub updated_by: Option<String>,
     pub isolation_mode: IsolationMode,
     pub catalog_type: CatalogType,
-    pub storage_root: String,
+    pub storage_root: Option<String>,
     pub provider_name: String,
-    pub storage_location: String,
+    pub storage_location: Option<String>,
     pub properties: HashMap<String, String>,
     pub share_name: String,
     pub comment: String,
     pub created_at: i64,
-    pub owner: String,
-    pub updated_at: i64,
+    pub owner: Option<String>,
+    pub updated_at: Option<i64>,
     pub metastore_id: String,
     pub enabled_predictive_optimization: String,
     pub effective_predictive_optimization_flag: EffectivePredictiveOptimizationFlag,
@@ -248,14 +248,14 @@ pub struct Schema {
 
     /// Username of schema creator.
     #[serde(default)]
-    pub created_by: String,
+    pub created_by: Option<String>,
 
     /// Name of schema, relative to parent catalog.
     pub name: String,
 
     /// Username of user who last modified schema.
     #[serde(default)]
-    pub updated_by: String,
+    pub updated_by: Option<String>,
 
     /// Full name of schema, in form of catalog_name.schema_name.
     pub full_name: String,
@@ -268,11 +268,11 @@ pub struct Schema {
 
     /// Storage root URL for managed tables within schema.
     #[serde(default)]
-    pub storage_root: String,
+    pub storage_root: Option<String>,
 
     /// Storage location for managed tables within schema.
     #[serde(default)]
-    pub storage_location: String,
+    pub storage_location: Option<String>,
 
     /// A map of key-value properties attached to the securable.
     #[serde(default)]
@@ -288,11 +288,11 @@ pub struct Schema {
 
     /// Username of current owner of schema.
     #[serde(default)]
-    pub owner: String,
+    pub owner: Option<String>,
 
     /// Time at which this schema was created, in epoch milliseconds.
     #[serde(default)]
-    pub updated_at: i64,
+    pub updated_at: Option<i64>,
 
     /// Unique identifier of parent metastore.
     pub metastore_id: String,
