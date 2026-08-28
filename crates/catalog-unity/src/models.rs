@@ -261,7 +261,8 @@ pub struct Schema {
     pub full_name: String,
 
     /// The type of the parent catalog.
-    pub catalog_type: String,
+    #[serde(default)]
+    pub catalog_type: Option<String>,
 
     /// Name of parent catalog.
     pub catalog_name: String,
@@ -295,7 +296,8 @@ pub struct Schema {
     pub updated_at: Option<i64>,
 
     /// Unique identifier of parent metastore.
-    pub metastore_id: String,
+    #[serde(default)]
+    pub metastore_id: Option<String>,
 }
 
 #[derive(Deserialize, Default, Debug)]
