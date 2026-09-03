@@ -180,6 +180,7 @@ pub struct MergeBuilder {
     /// Datafusion session state relevant for executing the input plan
     state: Option<Arc<dyn Session>>,
     session_fallback_policy: SessionFallbackPolicy,
+    extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
     /// Properties passed to underlying parquet writer for when files are rewritten
     writer_properties: Option<WriterProperties>,
     /// Additional information to add to the commit
@@ -217,6 +218,7 @@ impl MergeBuilder {
             target_alias: None,
             state: None,
             session_fallback_policy: SessionFallbackPolicy::default(),
+            extension_planners: Vec::new(),
             commit_properties: CommitProperties::default(),
             writer_properties: None,
             merge_schema: false,
@@ -439,6 +441,19 @@ impl MergeBuilder {
     /// Defaults to `SessionFallbackPolicy::InternalDefaults` to preserve existing behavior.
     pub fn with_session_fallback_policy(mut self, policy: SessionFallbackPolicy) -> Self {
         self.session_fallback_policy = policy;
+        self
+    }
+
+    /// Add an application planner for logical extension nodes in the source.
+    ///
+    /// Delta's own extension planner is always installed first. Adding an
+    /// application planner therefore cannot make the merge's metric, barrier,
+    /// or validation nodes unplannable.
+    pub fn with_extension_planner(
+        mut self,
+        planner: Arc<dyn ExtensionPlanner + Send + Sync>,
+    ) -> Self {
+        self.extension_planners.push(planner);
         self
     }
 
@@ -920,11 +935,6 @@ async fn execute(
     info!(cdc_enabled = should_cdc, "merge execution details");
 
     let current_metadata = snapshot.metadata();
-    let merge_planner = DeltaPlanner::new();
-
-    let state = SessionStateBuilder::new_from_existing(state)
-        .with_query_planner(merge_planner)
-        .build();
 
     // TODO: Given the join predicate, remove any expression that involve the
     // source table and keep expressions that only involve the target table.
@@ -1936,6 +1946,11 @@ impl std::future::IntoFuture for MergeBuilder {
                     cdc: false,
                 },
             )?;
+            let state = SessionStateBuilder::new_from_existing(state)
+                .with_query_planner(DeltaPlanner::with_extension_planners(
+                    this.extension_planners,
+                ))
+                .build();
 
             update_datafusion_session(&state, this.log_store.as_ref(), Some(operation_id))?;
 
@@ -1991,17 +2006,26 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use arrow_schema::DataType as ArrowDataType;
     use arrow_schema::Field;
+    use async_trait::async_trait;
     use dashmap::DashSet;
     use datafusion::assert_batches_sorted_eq;
+    use datafusion::catalog::Session;
     use datafusion::common::tree_node::TreeNodeRecursion;
-    use datafusion::common::{Column, ScalarValue, TableReference, ToDFSchema};
+    use datafusion::common::{
+        Column, DFSchemaRef, DataFusionError, ScalarValue, TableReference, ToDFSchema,
+    };
     use datafusion::datasource::provider_as_source;
+    use datafusion::error::Result as DataFusionResult;
     use datafusion::logical_expr::Expr;
     use datafusion::logical_expr::col;
     use datafusion::logical_expr::expr::BinaryExpr;
     use datafusion::logical_expr::expr::Placeholder;
     use datafusion::logical_expr::lit;
-    use datafusion::logical_expr::{Extension, LogicalPlan, LogicalPlanBuilder};
+    use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
+    use datafusion::logical_expr::{
+        Extension, LogicalPlan, LogicalPlanBuilder, UserDefinedLogicalNode,
+        UserDefinedLogicalNodeCore,
+    };
     use datafusion::physical_expr::PhysicalExpr;
     use datafusion::physical_expr::expressions::Column as PhysicalColumn;
     use datafusion::physical_plan::ExecutionPlan;
@@ -2009,6 +2033,7 @@ mod tests {
     use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
     use datafusion::physical_plan::metrics::MetricBuilder;
     use datafusion::physical_plan::{collect, displayable};
+    use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
     use datafusion::prelude::*;
     use delta_kernel::engine::arrow_conversion::TryIntoKernel;
     use delta_kernel::schema::StructType;
@@ -2016,13 +2041,18 @@ mod tests {
     use pretty_assertions::assert_eq;
     use regex::Regex;
     use serde_json::json;
+    use std::cmp::Ordering;
     use std::collections::HashMap;
+    use std::fmt;
     use std::ops::Neg;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use url::Url;
 
+    use crate::delta_datafusion::planner::DeltaPlanner;
     use crate::delta_datafusion::{
-        DataFusionMixins, DeltaScanNext, PATH_COLUMN, resolve_file_column_name,
+        DataFusionMixins, DeltaScanNext, PATH_COLUMN, SessionFallbackPolicy,
+        resolve_file_column_name,
     };
 
     use super::barrier::{MergeBarrier, MergeBarrierExec};
@@ -2034,6 +2064,119 @@ mod tests {
         TARGET_ROW_ORDINAL_IN_FILE_COLUMN, TARGET_UPDATE_COLUMN,
         build_duplicate_match_validation_plan, build_merge_barrier_validation_plan,
     };
+
+    const APPLICATION_NODE_NAME: &str = "ApplicationMergeSource";
+
+    #[derive(Clone, PartialEq, Eq, Hash)]
+    struct ApplicationNode {
+        input: LogicalPlan,
+    }
+
+    impl fmt::Debug for ApplicationNode {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(APPLICATION_NODE_NAME)
+        }
+    }
+
+    impl PartialOrd for ApplicationNode {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            (self == other).then_some(Ordering::Equal)
+        }
+    }
+
+    impl UserDefinedLogicalNodeCore for ApplicationNode {
+        fn name(&self) -> &str {
+            APPLICATION_NODE_NAME
+        }
+
+        fn inputs(&self) -> Vec<&LogicalPlan> {
+            vec![&self.input]
+        }
+
+        fn schema(&self) -> &DFSchemaRef {
+            self.input.schema()
+        }
+
+        fn expressions(&self) -> Vec<Expr> {
+            Vec::new()
+        }
+
+        fn fmt_for_explain(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            write!(formatter, "{APPLICATION_NODE_NAME}")
+        }
+
+        fn with_exprs_and_inputs(
+            &self,
+            expressions: Vec<Expr>,
+            inputs: Vec<LogicalPlan>,
+        ) -> DataFusionResult<Self> {
+            if !expressions.is_empty() || inputs.len() != 1 {
+                return Err(DataFusionError::Plan(
+                    "the application merge source requires one input and no expressions".to_owned(),
+                ));
+            }
+            Ok(Self {
+                input: inputs.into_iter().next().expect("one input was checked"),
+            })
+        }
+    }
+
+    struct ApplicationExtensionPlanner {
+        planned: Arc<AtomicBool>,
+    }
+
+    struct DelegatingApplicationPlanner {
+        delegated: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ExtensionPlanner for DelegatingApplicationPlanner {
+        async fn plan_extension(
+            &self,
+            _planner: &dyn PhysicalPlanner,
+            node: &dyn UserDefinedLogicalNode,
+            _logical_inputs: &[&LogicalPlan],
+            _physical_inputs: &[Arc<dyn ExecutionPlan>],
+            _session_state: &dyn Session,
+            _planning_ctx: &PhysicalPlanningContext,
+        ) -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
+            if node.as_any().downcast_ref::<ApplicationNode>().is_none() {
+                return Err(DataFusionError::Plan(format!(
+                    "the delegating application planner received Delta node {}",
+                    node.name()
+                )));
+            }
+            self.delegated.store(true, AtomicOrdering::SeqCst);
+            Ok(None)
+        }
+    }
+
+    #[async_trait]
+    impl ExtensionPlanner for ApplicationExtensionPlanner {
+        async fn plan_extension(
+            &self,
+            _planner: &dyn PhysicalPlanner,
+            node: &dyn UserDefinedLogicalNode,
+            _logical_inputs: &[&LogicalPlan],
+            physical_inputs: &[Arc<dyn ExecutionPlan>],
+            _session_state: &dyn Session,
+            _planning_ctx: &PhysicalPlanningContext,
+        ) -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
+            if node.as_any().downcast_ref::<ApplicationNode>().is_none() {
+                return Err(DataFusionError::Plan(format!(
+                    "the application planner received Delta node {} before Delta's planner",
+                    node.name()
+                )));
+            }
+            let input = physical_inputs.first().ok_or_else(|| {
+                DataFusionError::Plan(
+                    "the application source marker requires one physical input".to_owned(),
+                )
+            })?;
+            self.planned.store(true, AtomicOrdering::SeqCst);
+            Ok(Some(Arc::clone(input)))
+        }
+    }
 
     pub(crate) async fn setup_table(partitions: Option<Vec<&str>>) -> DeltaTable {
         let table_schema = get_delta_schema();
@@ -3374,6 +3517,84 @@ mod tests {
         );
 
         assert_merge(table, metrics).await;
+    }
+
+    #[tokio::test]
+    async fn merge_composes_application_and_delta_extension_planners() {
+        let (table, source) = setup().await;
+        let (source_state, source_plan) = source.into_parts();
+        let delegated = Arc::new(AtomicBool::new(false));
+        let planned = Arc::new(AtomicBool::new(false));
+        let source = DataFrame::new(
+            source_state.clone(),
+            LogicalPlan::Extension(Extension {
+                node: Arc::new(ApplicationNode { input: source_plan }),
+            }),
+        );
+
+        let (table, metrics) = table
+            .merge(source, col("target.id").eq(col("source.id")))
+            .with_source_alias("source")
+            .with_target_alias("target")
+            .with_session_state(Arc::new(source_state))
+            .with_session_fallback_policy(SessionFallbackPolicy::RequireSessionState)
+            .with_extension_planner(Arc::new(DelegatingApplicationPlanner {
+                delegated: Arc::clone(&delegated),
+            }))
+            .with_extension_planner(Arc::new(ApplicationExtensionPlanner {
+                planned: Arc::clone(&planned),
+            }))
+            .when_matched_update(|update| {
+                update
+                    .update("value", col("source.value"))
+                    .update("modified", col("source.modified"))
+            })
+            .unwrap()
+            .when_not_matched_by_source_update(|update| {
+                update
+                    .predicate(col("target.value").eq(lit(1)))
+                    .update("value", col("target.value") + lit(1))
+            })
+            .unwrap()
+            .when_not_matched_insert(|insert| {
+                insert
+                    .set("id", col("source.id"))
+                    .set("value", col("source.value"))
+                    .set("modified", col("source.modified"))
+            })
+            .unwrap()
+            .await
+            .unwrap();
+
+        assert!(
+            delegated.load(AtomicOrdering::SeqCst),
+            "the first application planner must delegate its foreign node"
+        );
+        assert!(
+            planned.load(AtomicOrdering::SeqCst),
+            "the second application planner must lower its source node"
+        );
+        assert_merge(table, metrics).await;
+    }
+
+    #[tokio::test]
+    async fn a_foreign_node_without_an_application_planner_is_rejected() {
+        let (_table, source) = setup().await;
+        let (source_state, source_plan) = source.into_parts();
+        let plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(ApplicationNode { input: source_plan }),
+        });
+
+        let error = DeltaPlanner::with_extension_planners(Vec::new())
+            .create_physical_plan(&plan, &source_state)
+            .await
+            .expect_err("an unclaimed application node is not executable");
+        let detail = format!("{error}");
+        assert!(
+            detail.contains("No installed planner was able to convert the custom node")
+                && detail.contains(APPLICATION_NODE_NAME),
+            "the rejection must identify the missing extension planner: {detail}"
+        );
     }
 
     #[tokio::test]

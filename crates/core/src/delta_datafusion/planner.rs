@@ -1,27 +1,11 @@
-//! Custom planners for datafusion so that you can convert custom nodes, can be used
-//! to trace custom metrics in an operation
+//! DataFusion query planners for Delta operations.
 //!
-//! # Example
-//!
-//! #[derive(Clone)]
-//! struct MergeMetricExtensionPlanner {}
-//!
-//! #[macro@async_trait]
-//! impl ExtensionPlanner for MergeMetricExtensionPlanner {
-//!     async fn plan_extension(
-//!         &self,
-//!         planner: &dyn PhysicalPlanner,
-//!         node: &dyn UserDefinedLogicalNode,
-//!         _logical_inputs: &[&LogicalPlan],
-//!         physical_inputs: &[Arc<dyn ExecutionPlan>],
-//!         session_state: &SessionState,
-//!     ) -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {}
-//!
-//! let merge_planner = DeltaPlanner::<MergeMetricExtensionPlanner> {
-//!     extension_planner: MergeMetricExtensionPlanner {}
-//! };
-//!
-//! let state = state.with_query_planner(Arc::new(merge_planner));
+//! [`DeltaPlanner`] always installs the extension planners required by
+//! delta-rs. Applications with their own logical extension nodes can add
+//! [`ExtensionPlanner`] trait objects through
+//! [`DeltaPlanner::with_extension_planners`] without replacing Delta's
+//! planners.
+use std::fmt;
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
@@ -67,6 +51,17 @@ impl DeltaPlanner {
     pub fn new() -> Arc<Self> {
         DELTA_PLANNER.clone()
     }
+
+    /// Compose delta-rs's planners with application extension planners.
+    ///
+    /// Delta's planner always has first opportunity to lower the logical nodes
+    /// introduced by Delta operations. Application planners are consulted, in
+    /// the order supplied, only when Delta does not recognize a node.
+    pub fn with_extension_planners(
+        extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
+    ) -> Arc<dyn QueryPlanner + Send + Sync> {
+        Arc::new(ComposedDeltaPlanner { extension_planners })
+    }
 }
 
 #[async_trait]
@@ -80,6 +75,36 @@ impl QueryPlanner for DeltaPlanner {
             vec![DeltaExtensionPlanner::new()],
         )));
         planner.create_physical_plan(logical_plan, session).await
+    }
+}
+
+struct ComposedDeltaPlanner {
+    extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
+}
+
+impl fmt::Debug for ComposedDeltaPlanner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ComposedDeltaPlanner")
+            .field("application_planner_count", &self.extension_planners.len())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl QueryPlanner for ComposedDeltaPlanner {
+    async fn create_physical_plan(
+        &self,
+        logical_plan: &LogicalPlan,
+        session: &dyn Session,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let mut extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> =
+            Vec::with_capacity(1 + self.extension_planners.len());
+        extension_planners.push(DeltaExtensionPlanner::new());
+        extension_planners.extend(self.extension_planners.iter().cloned());
+        DefaultPhysicalPlanner::with_extension_planners(extension_planners)
+            .create_physical_plan(logical_plan, session)
+            .await
     }
 }
 
