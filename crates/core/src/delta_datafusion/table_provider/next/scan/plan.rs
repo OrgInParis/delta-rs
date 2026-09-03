@@ -232,6 +232,13 @@ pub(crate) struct KernelScanPlan {
     pub(crate) parquet_predicate_schema: SchemaRef,
     /// If set, indicates a predicate to apply at the Parquet scan level
     pub(crate) parquet_predicate: Option<Expr>,
+    /// The kernel schema of the batches each file's transform is evaluated over: the scan's
+    /// physical schema, or its narrowing when a projection pushed into the scan reads a subset
+    /// of a struct column's fields (see [`narrowed`](Self::narrowed)).
+    pub(crate) evaluator_input_schema: delta_kernel::schema::SchemaRef,
+    /// The kernel schema the transform's output is typed as: the scan's logical schema, narrowed
+    /// alongside the input.
+    pub(crate) evaluator_output_schema: delta_kernel::schema::SchemaRef,
 }
 
 impl KernelScanPlan {
@@ -314,13 +321,57 @@ impl KernelScanPlan {
         )?;
         let parquet_predicate_schema =
             build_parquet_predicate_schema(&parquet_read_schema, &contract.file_id_field);
+        let evaluator_input_schema = Arc::clone(scan.physical_schema());
+        let evaluator_output_schema = Arc::clone(scan.logical_schema());
         Ok(Self {
             scan,
             contract,
             parquet_read_schema,
             parquet_predicate_schema,
             parquet_predicate,
+            evaluator_input_schema,
+            evaluator_output_schema,
         })
+    }
+
+    /// This plan narrowed to the struct fields `access` reads: the parquet read schema, the
+    /// contract's schemas and the transform's schemas each with those structs pruned to the
+    /// fields named, everything else — files, predicate, file id, the kernel scan — as it is.
+    /// `None` where the read schema would not change, which is what stops a projection that
+    /// was already pushed from being pushed again.
+    ///
+    /// Only meaningful where physical and logical names coincide, that is, without column
+    /// mapping; the caller checks.
+    pub(crate) fn narrowed(&self, access: &super::narrow::ColumnAccess) -> Result<Option<Self>> {
+        use super::narrow::{narrow_arrow_schema, narrow_kernel_schema};
+        let parquet_read_schema = Arc::new(narrow_arrow_schema(&self.parquet_read_schema, access));
+        if parquet_read_schema.as_ref() == self.parquet_read_schema.as_ref() {
+            return Ok(None);
+        }
+        let narrow = |schema: &SchemaRef| Arc::new(narrow_arrow_schema(schema, access));
+        let contract = ProjectedScanContract {
+            result_schema: narrow(&self.contract.result_schema),
+            scan_schema: narrow(&self.contract.scan_schema),
+            output_schema: narrow(&self.contract.output_schema),
+            ..self.contract.clone()
+        };
+        let parquet_predicate_schema =
+            build_parquet_predicate_schema(&parquet_read_schema, &contract.file_id_field);
+        Ok(Some(Self {
+            scan: Arc::clone(&self.scan),
+            contract,
+            parquet_read_schema,
+            parquet_predicate_schema,
+            parquet_predicate: self.parquet_predicate.clone(),
+            evaluator_input_schema: Arc::new(narrow_kernel_schema(
+                &self.evaluator_input_schema,
+                access,
+            )?),
+            evaluator_output_schema: Arc::new(narrow_kernel_schema(
+                &self.evaluator_output_schema,
+                access,
+            )?),
+        }))
     }
 
     /// Denotes if the scan can be resolved using only file metadata

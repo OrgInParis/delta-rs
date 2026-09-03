@@ -12,6 +12,7 @@ use datafusion::logical_expr::simplify::SimplifyContext;
 use datafusion::optimizer::simplify_expressions::ExprSimplifier;
 use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::statistics::{ChildStats, StatisticsArgs};
 use datafusion::physical_plan::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr,
@@ -660,6 +661,29 @@ impl ExecutionPlan for DeltaScan {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         self.parquet_scan.execute(partition, context)
+    }
+
+    /// ATP: a projection above the scan is offered to the parquet scan the
+    /// wrapper holds, and the wrapper is rebuilt over what the scan makes of
+    /// it. Without this the physical projection pushdown stopped at the
+    /// wrapper — `ExecutionPlan`'s default declines — so a struct field
+    /// access such as `properties.name` was evaluated above a scan that had
+    /// decoded the whole struct. The parquet source resolves such an access
+    /// to the leaf it names and decodes that leaf alone.
+    fn try_swapping_with_projection(
+        &self,
+        projection: &ProjectionExec,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let Some(parquet_scan) = self.parquet_scan.try_swapping_with_projection(projection)? else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(DeltaScan {
+            table_url: self.table_url.clone(),
+            config: self.config.clone(),
+            parquet_scan,
+            logical_schema: self.logical_schema.clone(),
+            metrics: self.metrics.clone(),
+        })))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

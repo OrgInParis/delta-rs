@@ -643,6 +643,20 @@ pub(crate) async fn write_streams(
         return Err(err);
     }
 
+    // Every partition stream funnels into the one `DeltaWriter` task above, so
+    // `write_time_ms` is time spent inside a single thread encoding parquet and
+    // collecting statistics, however many partitions fed it. That number was
+    // being computed and discarded; a run that spends a quarter of its wall
+    // clock here with the query engine idle cannot be diagnosed without it.
+    tracing::info!(
+        target: "deltalake_core::operations::write",
+        workers = worker_count,
+        rows_written,
+        write_time_ms,
+        files = adds.len(),
+        "delta write streams drained"
+    );
+
     Ok((
         adds,
         WriteStreamMetrics {
@@ -652,18 +666,104 @@ pub(crate) async fn write_streams(
     ))
 }
 
+/// Drive every stream with its own [`DeltaWriter`], concurrently.
+///
+/// A write yields independent files and independent `Add` actions, so there is
+/// no reason for the streams to share a writer — and sharing one makes the
+/// write serial no matter how wide the plan above it is. Both the partitioned
+/// and unpartitioned write paths use this.
+///
+/// `write_time_ms` in the returned metrics is the **slowest** writer, because
+/// the writers run concurrently and that is what the caller waits for. The sum
+/// of their times is reported on the log line instead, where the gap between
+/// the two shows how much of the available width was actually used.
+async fn write_streams_parallel(
+    streams: Vec<SendableRecordBatchStream>,
+    object_store: ObjectStoreRef,
+    config: WriterConfig,
+) -> DeltaResult<(Vec<Add>, WriteStreamMetrics)> {
+    let stream_count = streams.len();
+    let mut join_set = JoinSet::new();
+    for mut stream in streams {
+        let store = object_store.clone();
+        let config = config.clone();
+        join_set.spawn(async move {
+            let mut writer = DeltaWriter::new(store, config);
+            let mut write_ms: u64 = 0;
+            let mut rows: u64 = 0;
+            while let Some(maybe_batch) = stream.next().await {
+                let batch = maybe_batch?;
+                rows += batch.num_rows() as u64;
+                let wstart = std::time::Instant::now();
+                writer.write(&batch).await?;
+                write_ms += wstart.elapsed().as_millis() as u64;
+            }
+            let adds = writer.close().await?;
+            Ok::<(Vec<Add>, u64, u64), DeltaTableError>((adds, write_ms, rows))
+        });
+    }
+
+    let mut all_adds = Vec::new();
+    let mut max_write_ms: u64 = 0;
+    let mut total_write_ms: u64 = 0;
+    let mut total_rows: u64 = 0;
+    let mut writers_with_rows: usize = 0;
+    while let Some(join_res) = join_set.join_next().await {
+        let result = join_res
+            .map_err(|e| DeltaTableError::Generic(format!("writer task join error: {e}")))?;
+        match result {
+            Ok((adds, write_ms, rows)) => {
+                all_adds.extend(adds);
+                max_write_ms = max_write_ms.max(write_ms);
+                total_write_ms += write_ms;
+                total_rows += rows;
+                if rows > 0 {
+                    writers_with_rows += 1;
+                }
+            }
+            Err(e) => {
+                join_set.abort_all();
+                return Err(e);
+            }
+        }
+    }
+
+    // A stream that received no rows is width that was available and unused.
+    // For a partitioned write that is the partition column's cardinality
+    // bounding the writers; for an unpartitioned one it should not happen.
+    tracing::info!(
+        target: "deltalake_core::operations::write",
+        streams = stream_count,
+        writers_with_rows,
+        rows_written = total_rows,
+        max_write_ms,
+        total_write_ms,
+        files = all_adds.len(),
+        "delta parallel write drained"
+    );
+
+    Ok((
+        all_adds,
+        WriteStreamMetrics {
+            rows_written: total_rows,
+            write_time_ms: max_write_ms,
+        },
+    ))
+}
+
 fn is_writer_task_closed_error(err: &DeltaTableError) -> bool {
     matches!(err, DeltaTableError::Generic(msg) if msg == WRITER_TASK_CLOSED_UNEXPECTEDLY_MSG)
 }
 
-/// Hash repartitions the plan by partition columns so each stream
-/// writes to disjoint Delta partitions.
-/// The output partition count is capped by `DELTARS_MAX_CONCURRENT_WRITERS`
-/// Returns the plan unchanged if there is only a single stream.
-fn repartition_by_partition_columns(
-    plan: Arc<dyn ExecutionPlan>,
-    partition_columns: &[String],
-) -> DeltaResult<Arc<dyn ExecutionPlan>> {
+/// Spreads the plan evenly across writer streams.
+///
+/// The count is capped by `DELTARS_MAX_CONCURRENT_WRITERS`; a plan that is
+/// already a single stream is returned unchanged.
+///
+/// Renamed from `repartition_by_partition_columns`: it no longer takes the
+/// partition columns, because it no longer hashes on them. See the body for
+/// why that hash was both unnecessary and the cap on write parallelism.
+fn repartition_for_writers(plan: Arc<dyn ExecutionPlan>) -> DeltaResult<Arc<dyn ExecutionPlan>> {
     let original_count = plan.output_partitioning().partition_count();
 
     if original_count <= 1 {
@@ -672,14 +772,29 @@ fn repartition_by_partition_columns(
 
     let num_partitions = original_count.min(max_concurrent_writers());
 
-    let schema = plan.schema();
-    let hash_exprs = partition_columns
-        .iter()
-        .map(|name| physical_col(name, &schema).map(|e| e as _))
-        .collect::<Result<Vec<_>, _>>()?;
+    // Round robin, not a hash on the partition columns.
+    //
+    // Hashing put every row of one partition value in one stream, so exactly
+    // one writer ever touched that value — and the *number of writers* became
+    // the cardinality of the partition column. Measured: a table partitioned
+    // on `semantic_type`, which takes two values, ran 2 of 20 writers and
+    // spent 69.9 s where the work was 138.5 s; one partitioned on `role` ran
+    // 3 of 20. Eighteen and seventeen spawned tasks idle.
+    //
+    // The hash was never needed for correctness. `DeltaWriter` holds a
+    // `PartitionWriter` per value and `write` splits each batch with
+    // `divide_by_partition_values`, so any writer can be handed any mix of
+    // values and still produce correctly partitioned files. What the hash
+    // bought was file *count*: one writer per value means one open file per
+    // value instead of up to N.
+    //
+    // Round robin trades that for width — each value may now be written by
+    // every stream, so a value's files go from one series to as many as N,
+    // each still packed to `target_file_size`. The layout is unchanged, so
+    // partition pruning is exactly as it was.
     Ok(Arc::new(RepartitionExec::try_new(
         plan,
-        Partitioning::Hash(hash_exprs, num_partitions),
+        Partitioning::RoundRobinBatch(num_partitions),
     )?))
 }
 
@@ -710,11 +825,39 @@ async fn write_data_plan(
     )
     .with_random_prefix_length(random_prefix_length);
 
-    // For unpartitioned writes, centralize writer behavior through write_streams.
+    // An unpartitioned write is written by one writer per input stream, the
+    // same way a partitioned one is.
+    //
+    // It used to funnel every stream through a single mpsc into a single
+    // `DeltaWriter`, so the write was serial however many partitions fed it.
+    // Measured on a 87.4 M-row table: twenty streams, one writer, 129.9 s —
+    // the whole ingest stage, with nineteen cores idle. Nothing required it.
+    // A write produces independent files and independent `Add` actions, which
+    // is exactly why the partitioned branch below is already allowed to run a
+    // writer per stream.
+    //
+    // The cost is that each writer packs to `target_file_size` independently,
+    // so the tail of each stream is a partial file — N partial files instead
+    // of one. `write_streams` is kept for the single-stream sink and for the
+    // tests that cover its channel's failure propagation.
     if partition_columns.is_empty() {
+        // Bounded by `DELTARS_MAX_CONCURRENT_WRITERS` like the partitioned
+        // path, because the bound exists to cap writer *memory* and this is
+        // the path that holds the most of it.
+        //
+        // Each `DeltaWriter` buffers toward `target_file_size` plus its
+        // in-progress row groups, and none of that registers with DataFusion's
+        // memory pool — so the pool's limit does not see it. Taking this path
+        // from one writer to one per partition was worth 129.9 s to 8.8 s, but
+        // it multiplied that unaccounted buffer by the partition count, and on
+        // the full corpus the process reached 124.4 GB of anonymous RSS
+        // against a 104 GiB pool limit and was killed. The width is worth
+        // having; it needs to be capped.
+        let plan = repartition_for_writers(plan)?;
         let partition_streams = execute_stream_partitioned(plan, session.task_ctx())?;
         let scan_start = std::time::Instant::now();
-        let (adds, stream_metrics) = write_streams(partition_streams, object_store, config).await?;
+        let (adds, stream_metrics) =
+            write_streams_parallel(partition_streams, object_store, config).await?;
 
         let scan_time_ms = scan_start
             .elapsed()
@@ -730,45 +873,13 @@ async fn write_data_plan(
         return Ok((actions, metrics));
     }
 
-    let plan = repartition_by_partition_columns(plan, &partition_columns)?;
+    let plan = repartition_for_writers(plan)?;
     let partition_streams = execute_stream_partitioned(plan, session.task_ctx())?;
     let scan_start = std::time::Instant::now();
 
-    let mut join_set = JoinSet::new();
-    for mut stream in partition_streams {
-        let store = object_store.clone();
-        let config = config.clone();
-        join_set.spawn(async move {
-            let mut writer = DeltaWriter::new(store, config);
-            let mut write_ms: u64 = 0;
-            while let Some(maybe_batch) = stream.next().await {
-                let batch = maybe_batch?;
-                let wstart = std::time::Instant::now();
-                writer.write(&batch).await?;
-                write_ms += wstart.elapsed().as_millis() as u64;
-            }
-            let adds = writer.close().await?;
-            Ok::<(Vec<Add>, u64), DeltaTableError>((adds, write_ms))
-        });
-    }
-
-    let mut all_adds = Vec::new();
-    // Writers run in parallel, so wall-clock write time is the slowest task
-    let mut max_write_ms: u64 = 0;
-    while let Some(join_res) = join_set.join_next().await {
-        let result = join_res
-            .map_err(|e| DeltaTableError::Generic(format!("writer task join error: {e}")))?;
-        match result {
-            Ok((adds, write_ms)) => {
-                all_adds.extend(adds);
-                max_write_ms = max_write_ms.max(write_ms);
-            }
-            Err(e) => {
-                join_set.abort_all();
-                return Err(e);
-            }
-        }
-    }
+    let (all_adds, stream_metrics) =
+        write_streams_parallel(partition_streams, object_store, config).await?;
+    let max_write_ms = stream_metrics.write_time_ms;
 
     let scan_elapsed = scan_start.elapsed().as_millis() as u64;
     let scan_time_ms = scan_elapsed.saturating_sub(max_write_ms);
@@ -1009,7 +1120,7 @@ async fn write_cdc_plan(
         return Ok((actions, metrics));
     }
 
-    let plan = repartition_by_partition_columns(plan, &partition_columns)?;
+    let plan = repartition_for_writers(plan)?;
     let partition_streams = execute_stream_partitioned(plan, session.task_ctx())?;
     let scan_start = std::time::Instant::now();
     let mut join_set = JoinSet::new();

@@ -21,6 +21,7 @@ pub mod transaction;
 pub use arrow::engine_ext::StructDataExt;
 pub use delta_kernel::Version;
 pub use delta_kernel::engine;
+pub use delta_kernel::expressions::{Scalar, StructData};
 pub use error::*;
 pub use models::*;
 pub use schema::*;

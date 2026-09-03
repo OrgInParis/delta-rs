@@ -167,6 +167,12 @@ pub struct MergeBuilder {
     source: DataFrame,
     /// Whether the source is a streaming source (if true, stats deducing to prune target is disabled)
     streaming: bool,
+    /// A caller-stated scope of the target — normally a partition predicate —
+    /// used as the target subset filter in place of the one derived from the
+    /// join predicate. The caller vouches that every row the join could match
+    /// and every row a `when not matched by source` clause could touch lies
+    /// within it.
+    target_filter: Option<Expression>,
     /// Enable merge schema evolution
     merge_schema: bool,
     /// Delta object store for handling data files
@@ -219,6 +225,7 @@ impl MergeBuilder {
             not_match_source_operations: Vec::new(),
             safe_cast: false,
             streaming: false,
+            target_filter: None,
             custom_execute_handler: None,
         }
     }
@@ -459,6 +466,21 @@ impl MergeBuilder {
     /// Test123     ->      null
     pub fn with_safe_cast(mut self, safe_cast: bool) -> Self {
         self.safe_cast = safe_cast;
+        self
+    }
+
+    /// Scope the target to the rows `filter` selects, a predicate over the
+    /// target alone. It stands in for the target subset filter the merge
+    /// would otherwise derive from the join predicate — which it derives not
+    /// at all once a `when not matched by source` clause is present, since
+    /// such a clause implies a full scan in general. A caller whose
+    /// not-matched-by-source predicates are contained in `filter` (a
+    /// partition, say) states that here, and the merge scans, joins and
+    /// rewrites that scope only. Rows outside it are never seen: a filter
+    /// that does not contain every matchable or retirable row silently
+    /// leaves them unmerged.
+    pub fn with_target_filter<E: Into<Expression>>(mut self, filter: E) -> Self {
+        self.target_filter = Some(filter.into());
         self
     }
 
@@ -868,6 +890,7 @@ async fn execute(
     mut commit_properties: CommitProperties,
     safe_cast: bool,
     streaming: bool,
+    target_filter: Option<Expression>,
     source_alias: Option<String>,
     target_alias: Option<String>,
     merge_schema: bool,
@@ -978,21 +1001,27 @@ async fn execute(
     // In the case where there are partition columns in the join predicate, we can scan the source table
     // to get the distinct list of partitions affected and constrain the search to those.
 
-    let target_subset_filter: Option<Expr> = if !not_match_source_operations.is_empty() {
-        // It's only worth trying to create an early filter where there are no `when_not_matched_source` operators, since
-        // that implies a full scan
-        None
-    } else {
-        try_construct_early_filter(
-            predicate.clone(),
-            &snapshot,
-            &state,
-            &source,
-            &source_name,
-            &target_name,
-            streaming,
-        )
-        .await?
+    let target_subset_filter: Option<Expr> = match target_filter {
+        // The caller stated the target's scope and vouched for it: it is
+        // used as the subset filter, whatever clauses the merge carries.
+        Some(filter) => Some(filter.resolve(&state, Arc::new(join_schema_df.clone()))?),
+        None if !not_match_source_operations.is_empty() => {
+            // It's only worth trying to create an early filter where there are no `when_not_matched_source` operators, since
+            // that implies a full scan
+            None
+        }
+        None => {
+            try_construct_early_filter(
+                predicate.clone(),
+                &snapshot,
+                &state,
+                &source,
+                &source_name,
+                &target_name,
+                streaming,
+            )
+            .await?
+        }
     }
     .map(|e| normalize_target_subset_filter(target.schema().clone(), e))
     .transpose()?;
@@ -1920,6 +1949,7 @@ impl std::future::IntoFuture for MergeBuilder {
                 this.commit_properties,
                 this.safe_cast,
                 this.streaming,
+                this.target_filter,
                 this.source_alias,
                 this.target_alias,
                 this.merge_schema,

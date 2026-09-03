@@ -148,6 +148,11 @@ pub struct VacuumBuilder {
     clock: Option<Arc<dyn Clock>>,
     /// Additional information to add to the commit
     commit_properties: CommitProperties,
+    /// Properties for the VACUUM START commit, when a caller needs the two
+    /// commits a vacuum writes to carry distinct application transactions
+    /// and domain metadata; absent, the start commit carries the end
+    /// commit's application metadata only.
+    start_commit_properties: Option<CommitProperties>,
     custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
 }
 
@@ -205,6 +210,7 @@ impl VacuumBuilder {
             parallel_scan: true,
             clock: None,
             commit_properties: CommitProperties::default(),
+            start_commit_properties: None,
             custom_execute_handler: None,
         }
     }
@@ -278,6 +284,15 @@ impl VacuumBuilder {
     /// Additional metadata to be added to commit info
     pub fn with_commit_properties(mut self, commit_properties: CommitProperties) -> Self {
         self.commit_properties = commit_properties;
+        self
+    }
+
+    /// Additional metadata, application transactions and domain metadata to
+    /// be added to the VACUUM START commit; the properties given to
+    /// [`with_commit_properties`](Self::with_commit_properties) then apply to
+    /// the VACUUM END commit alone.
+    pub fn with_start_commit_properties(mut self, commit_properties: CommitProperties) -> Self {
+        self.start_commit_properties = Some(commit_properties);
         self
     }
 
@@ -569,6 +584,7 @@ impl std::future::IntoFuture for VacuumBuilder {
                     this.log_store.clone(),
                     &snapshot,
                     this.commit_properties.clone(),
+                    this.start_commit_properties.clone(),
                     operation_id,
                     this.get_custom_execute_handler(),
                 )
@@ -611,6 +627,7 @@ impl VacuumPlan {
         store: LogStoreRef,
         snapshot: &EagerSnapshot,
         mut commit_properties: CommitProperties,
+        start_commit_properties: Option<CommitProperties>,
         operation_id: uuid::Uuid,
         handle: Option<Arc<dyn CustomExecuteHandler>>,
     ) -> Result<Option<(DeltaTableState, VacuumMetrics)>, DeltaTableError> {
@@ -634,8 +651,11 @@ impl VacuumPlan {
         };
 
         // Begin VACUUM START COMMIT
-        let mut start_props = CommitProperties::default();
-        start_props.app_metadata = commit_properties.app_metadata.clone();
+        let mut start_props = start_commit_properties.unwrap_or_else(|| {
+            let mut derived = CommitProperties::default();
+            derived.app_metadata = commit_properties.app_metadata.clone();
+            derived
+        });
         start_props.app_metadata.insert(
             "operationMetrics".to_owned(),
             serde_json::to_value(start_metrics)?,

@@ -83,6 +83,7 @@ use crate::{
 mod exec;
 mod exec_meta;
 mod expr_adapter;
+mod narrow;
 mod plan;
 mod replay;
 

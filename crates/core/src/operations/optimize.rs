@@ -958,8 +958,13 @@ impl MergePlan {
                 let actions = std::mem::take(&mut actions);
                 last_commit = now;
 
-                let mut properties = CommitProperties::default();
-                properties.app_metadata = commit_properties.app_metadata.clone();
+                // The caller's properties whole — application metadata,
+                // application transactions and domain metadata — so a commit
+                // an optimize writes carries what the caller committed it
+                // under, the way a merge or a delete does. With a commit
+                // interval the same transactions and domain metadata are
+                // written with each commit the optimize makes.
+                let mut properties = commit_properties.clone();
                 properties
                     .app_metadata
                     .insert("readVersion".to_owned(), self.read_table_version.into());

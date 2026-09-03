@@ -27,6 +27,7 @@ use datafusion::physical_expr::{Distribution, EquivalenceProperties};
 use datafusion::physical_plan::execution_plan::{CardinalityEffect, PlanProperties};
 use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::statistics::{ChildStats, StatisticsArgs};
 use datafusion::physical_plan::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan,
@@ -39,6 +40,7 @@ use delta_kernel::{EvaluationHandler, ExpressionRef};
 use futures::stream::{Stream, StreamExt};
 
 use super::expr_adapter::DeltaPhysicalExprAdapterFactory;
+use super::narrow::{self, FieldAccess};
 use super::plan::KernelScanPlan;
 use crate::delta_datafusion::file_id::file_id_field;
 use crate::kernel::ARROW_HANDLER;
@@ -372,6 +374,63 @@ impl ExecutionPlan for DeltaScanExec {
         }
     }
 
+    /// ATP: a projection above the scan that reads struct columns through their fields narrows
+    /// the scan to those fields. The parquet read is rebuilt under a table schema whose structs
+    /// hold the fields read, so the reader decodes those leaves alone; the scan contract and the
+    /// transform's schemas are narrowed alongside; and the projection is returned unchanged
+    /// above the narrowed scan, top-level columns keeping their positions. See
+    /// [`narrow`](super::narrow).
+    ///
+    /// Declined — the projection stays where it is — where names would differ between the file
+    /// and the table (column mapping), where a row index is retained, where a field is read of a
+    /// column the parquet read does not carry (a partition column or the file id, materialised
+    /// above the read), where the projection reads no field, and where the scan already reads
+    /// exactly the fields asked for.
+    fn try_swapping_with_projection(
+        &self,
+        projection: &ProjectionExec,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        if self
+            .scan_plan
+            .table_configuration()
+            .is_feature_enabled(&TableFeature::ColumnMapping)
+        {
+            return Ok(None);
+        }
+        if self.scan_plan.contract.retained_row_index_field().is_some() {
+            return Ok(None);
+        }
+        let Some(access) = narrow::access_of(projection.expr(), &self.schema()) else {
+            return Ok(None);
+        };
+        let materialised_above_read = access.iter().any(|(name, column)| {
+            matches!(column, FieldAccess::Fields(_))
+                && self.scan_plan.parquet_read_schema.field_with_name(name).is_err()
+        });
+        if materialised_above_read {
+            return Ok(None);
+        }
+        let Some(narrowed) = self.scan_plan.narrowed(&access)? else {
+            return Ok(None);
+        };
+        let Some(input) = narrow::narrowed_parquet_input(&self.input, &narrowed)? else {
+            return Ok(None);
+        };
+        let scan = Self::new(
+            Arc::new(narrowed),
+            input,
+            Arc::clone(&self.transforms),
+            Arc::clone(&self.selection_vectors),
+            Arc::clone(&self.public_file_ids),
+            self.partition_stats.clone(),
+            ExecutionPlanMetricsSet::new(),
+        );
+        Ok(Some(Arc::new(ProjectionExec::try_new(
+            projection.expr().iter().cloned(),
+            Arc::new(scan) as Arc<dyn ExecutionPlan>,
+        )?)))
+    }
+
     fn execute(
         &self,
         partition: usize,
@@ -390,7 +449,7 @@ impl ExecutionPlan for DeltaScanExec {
 
         Ok(Box::pin(DeltaScanStream {
             scan_plan: Arc::clone(&self.scan_plan),
-            kernel_type: Arc::clone(self.scan_plan.scan.logical_schema()).into(),
+            kernel_type: Arc::clone(&self.scan_plan.evaluator_output_schema).into(),
             input: self.input.execute(partition, context)?,
             baseline_metrics: BaselineMetrics::new(&self.metrics, partition),
             transforms: Arc::clone(&self.transforms),
@@ -604,7 +663,7 @@ impl DeltaScanStream {
         let result = if let Some(transform) = self.transforms.get(&file_id) {
             let evaluator = ARROW_HANDLER
                 .new_expression_evaluator(
-                    self.scan_plan.scan.physical_schema().clone(),
+                    Arc::clone(&self.scan_plan.evaluator_input_schema),
                     transform.clone(),
                     self.kernel_type.clone(),
                 )
