@@ -183,7 +183,10 @@ fn narrow_arrow_field(field: &Field, access: &FieldAccess) -> Option<Field> {
 
 /// The kernel schema `schema` narrowed exactly as [`narrow_arrow_schema`]
 /// narrows the Arrow one: what the per-file transform is evaluated between.
-pub(crate) fn narrow_kernel_schema(schema: &StructType, access: &ColumnAccess) -> Result<StructType> {
+pub(crate) fn narrow_kernel_schema(
+    schema: &StructType,
+    access: &ColumnAccess,
+) -> Result<StructType> {
     let fields = schema
         .fields()
         .map(|field| match access.get(field.name().as_str()) {
@@ -264,9 +267,7 @@ pub(crate) fn narrowed_parquet_input(
         source = source.with_parquet_file_reader_factory(Arc::clone(factory));
     }
     if let Some(predicate) = FileSource::filter(parquet) {
-        source = source
-            .with_predicate(predicate)
-            .with_pushdown_filters(true);
+        source = source.with_predicate(predicate).with_pushdown_filters(true);
     }
     let config = FileScanConfigBuilder::from(config.clone())
         .with_source(Arc::new(source))
@@ -324,7 +325,11 @@ mod tests {
         };
         assert_eq!(address.len(), 1);
         assert_eq!(address[0].name(), "city");
-        assert_eq!(narrowed.field(0), person().field(0), "an unnamed column is untouched");
+        assert_eq!(
+            narrowed.field(0),
+            person().field(0),
+            "an unnamed column is untouched"
+        );
     }
 
     #[test]
@@ -332,7 +337,10 @@ mod tests {
         let mut whole = ColumnAccess::new();
         whole.insert("properties".to_owned(), FieldAccess::Whole);
         assert_eq!(narrow_arrow_schema(&person(), &whole), person());
-        assert_eq!(narrow_arrow_schema(&person(), &access(&[&["missing"]])), person());
+        assert_eq!(
+            narrow_arrow_schema(&person(), &access(&[&["missing"]])),
+            person()
+        );
     }
 
     #[test]

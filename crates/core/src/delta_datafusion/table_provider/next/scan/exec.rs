@@ -405,7 +405,11 @@ impl ExecutionPlan for DeltaScanExec {
         };
         let materialised_above_read = access.iter().any(|(name, column)| {
             matches!(column, FieldAccess::Fields(_))
-                && self.scan_plan.parquet_read_schema.field_with_name(name).is_err()
+                && self
+                    .scan_plan
+                    .parquet_read_schema
+                    .field_with_name(name)
+                    .is_err()
         });
         if materialised_above_read {
             return Ok(None);
