@@ -123,7 +123,13 @@ impl From<DataFusionError> for DeltaTableError {
             DataFusionError::IoError(source) => DeltaTableError::Io { source },
             DataFusionError::ObjectStore(source) => DeltaTableError::from(*source),
             DataFusionError::ParquetError(source) => DeltaTableError::from(*source),
-            _ => DeltaTableError::Generic(err.to_string()),
+            // Preserve the typed cause across execution-plan boundaries. In
+            // particular, validation streams return External(InvalidData),
+            // often wrapped in Context/Shared by DataFusion. Rendering here
+            // erased the distinction between invalid input and broken state.
+            _ => DeltaTableError::GenericError {
+                source: Box::new(err),
+            },
         }
     }
 }
