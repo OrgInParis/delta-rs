@@ -298,11 +298,21 @@ pub struct DeltaRuntimeEnvBuilder {
 }
 
 impl DeltaRuntimeEnvBuilder {
+    /// Create a fresh table-path-aware registry for one authorization scope.
+    ///
+    /// Applications may share DataFusion memory and disk budgets while keeping
+    /// credential-bearing stores separate. This registry partitions sibling
+    /// table paths, not principals: never share it across authorization scopes.
+    pub fn object_store_registry()
+    -> Arc<dyn datafusion::execution::object_store::ObjectStoreRegistry> {
+        Arc::new(ScopedObjectStoreRegistry::default())
+    }
+
     /// Create a new builder with DataFusion's default runtime settings.
     pub fn new() -> Self {
         Self {
             inner: RuntimeEnvBuilder::new()
-                .with_object_store_registry(Arc::new(ScopedObjectStoreRegistry::default())),
+                .with_object_store_registry(Self::object_store_registry()),
         }
     }
 
