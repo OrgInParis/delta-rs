@@ -90,19 +90,13 @@ fn aws_storage_handler(
     store: AmazonS3,
     s3_options: &S3StorageOptions,
 ) -> DeltaResult<ObjectStoreRef> {
-    // Nearly all S3 Object stores support conditional put, so we change the default to always returning an S3 Object store
-    // unless explicitly passing a locking provider key or allow_unsafe_rename. Then we will pass it to the old S3StorageBackend.
-    if s3_options.locking_provider.as_deref() == Some("dynamodb") || s3_options.allow_unsafe_rename
-    {
-        let store = S3StorageBackend::try_new(
-            Arc::new(store),
-            Some("dynamodb") == s3_options.locking_provider.as_deref()
-                || s3_options.allow_unsafe_rename,
-        )?;
-        Ok(Arc::new(store))
-    } else {
-        Ok(Arc::new(store))
-    }
+    // Keep native conditional writes. The wrapper resolves only the optional hint's
+    // missing-object ambiguity without widening a prefix-scoped IAM session.
+    Ok(Arc::new(S3StorageBackend::try_new(
+        Arc::new(store),
+        Some("dynamodb") == s3_options.locking_provider.as_deref()
+            || s3_options.allow_unsafe_rename,
+    )?))
 }
 
 // Determine whether this crate is being configured for use with native AWS S3 or an S3-alike
@@ -248,7 +242,15 @@ impl ObjectStore for S3StorageBackend {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
-        self.inner.get_opts(location, options).await
+        match self.inner.get_opts(location, options).await {
+            Ok(result) => Ok(result),
+            Err(error) => Err(crate::checkpoint_hint::resolve_denied_hint(
+                location,
+                error,
+                &|prefix| self.inner.list(Some(&prefix)),
+            )
+            .await),
+        }
     }
 
     async fn get_ranges(

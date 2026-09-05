@@ -3,6 +3,7 @@
 //! This module also contains the [S3DynamoDbLogStore](crate::logstore::S3DynamoDbLogStore)
 //! implementation for concurrent writer support with AWS S3 specifically.
 
+mod checkpoint_hint;
 pub mod constants;
 mod credentials;
 pub mod logstore;
