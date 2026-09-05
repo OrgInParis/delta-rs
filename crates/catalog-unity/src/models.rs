@@ -281,7 +281,7 @@ pub struct Schema {
 
     /// User-provided free-form text description.
     #[serde(default)]
-    pub comment: String,
+    pub comment: Option<String>,
 
     /// Time at which this schema was created, in epoch milliseconds.
     #[serde(default)]
@@ -846,6 +846,34 @@ pub(crate) mod tests {
         let get_schema: Result<GetSchemaResponse, _> = serde_json::from_str(GET_SCHEMA_RESPONSE);
         assert!(get_schema.is_ok());
         assert!(matches!(get_schema.unwrap(), GetSchemaResponse::Success(_)))
+    }
+
+    #[test]
+    fn native_schema_optional_comment_is_nullable() {
+        for comment in [serde_json::Value::Null, serde_json::json!("description")] {
+            let response = serde_json::json!({
+                "name": "schema", "catalog_name": "catalog",
+                "full_name": "catalog.schema", "schema_id": "schema-id",
+                "owner": "owner", "properties": {}, "comment": comment,
+                "created_at": 1, "updated_at": 1
+            });
+            let parsed: GetSchemaResponse = serde_json::from_value(response.clone()).unwrap();
+            let GetSchemaResponse::Success(schema) = parsed else {
+                panic!("a native schema response must not decode as an API error");
+            };
+            assert_eq!(schema.comment.as_deref(), comment.as_str());
+            let mut absent = response;
+            absent.as_object_mut().unwrap().remove("comment");
+            let parsed: Schema = serde_json::from_value(absent).unwrap();
+            assert!(parsed.comment.is_none());
+        }
+        for invalid in [serde_json::json!(1), serde_json::json!({})] {
+            let response = serde_json::json!({
+                "name": "schema", "catalog_name": "catalog",
+                "full_name": "catalog.schema", "comment": invalid
+            });
+            assert!(serde_json::from_value::<Schema>(response).is_err());
+        }
     }
 
     #[test]
