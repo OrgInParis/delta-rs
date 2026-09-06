@@ -25,6 +25,20 @@ use serde_json::Value;
 use tracing::log;
 use url::Url;
 
+/// `FileAction` paths have already been URI-decoded by `serde_path`.
+/// Preserve that object key: `PartitionedFile::new` routes through
+/// `Path::from`, which percent-encodes literal percent signs a second time.
+pub(crate) fn partitioned_file(path: &str, size: u64) -> DeltaResult<PartitionedFile> {
+    use chrono::TimeZone;
+    Ok(PartitionedFile::new_from_meta(object_store::ObjectMeta {
+        location: Path::parse(path)?,
+        last_modified: chrono::Utc.timestamp_nanos(0),
+        size,
+        e_tag: None,
+        version: None,
+    }))
+}
+
 pub fn map_action_to_scalar<F: FileAction>(
     action: &F,
     part: &str,
@@ -180,7 +194,7 @@ async fn push_pair_selection(
     ];
     part_values.extend_from_slice(table_partition_values);
 
-    let part_file = PartitionedFile::new(&pair.add.path, pair.add.size as u64)
+    let part_file = partitioned_file(&pair.add.path, pair.add.size as u64)?
         .with_partition_values(part_values.clone())
         .with_extension(access_plan);
     groups.entry(part_values).or_default().push(part_file);
@@ -375,7 +389,12 @@ async fn read_parquet_metadata(
 ) -> DeltaResult<Arc<ParquetMetaData>> {
     let arrow_reader = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
     Ok(cache
-        .create_reader(0, PartitionedFile::new(file_path, file_size), None, metrics)?
+        .create_reader(
+            0,
+            partitioned_file(file_path.as_ref(), file_size)?,
+            None,
+            metrics,
+        )?
         .get_metadata(Some(&arrow_reader))
         .await?)
 }

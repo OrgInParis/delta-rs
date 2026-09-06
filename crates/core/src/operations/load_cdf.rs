@@ -507,8 +507,11 @@ impl CdfLoadBuilder {
 
                 let mut new_part_values = spec_partition_values.clone();
                 new_part_values.extend(partition_values);
-                let mut part_file = PartitionedFile::new(action.path(), action.size()? as u64)
-                    .with_partition_values(new_part_values.clone());
+                let mut part_file = crate::delta_datafusion::cdf::partitioned_file(
+                    &action.path(),
+                    action.size()? as u64,
+                )?
+                .with_partition_values(new_part_values.clone());
 
                 if let Some(access_plan) = create_file_scan_plan(
                     Arc::clone(&self.log_store.engine(None)),
@@ -723,6 +726,66 @@ pub(crate) mod tests {
     use crate::{DeltaTable, TableProperty};
     use std::path::Path;
     use url::Url;
+
+    #[tokio::test]
+    async fn cdf_decodes_uri_paths_once_for_add_remove_and_change_files() -> TestResult {
+        use datafusion::prelude::{col, lit};
+        let declared = TestSchemas::simple();
+        let table = DeltaTable::new_in_memory()
+            .create()
+            .with_columns(declared.fields().cloned())
+            .with_partition_columns(["id"])
+            .with_configuration_property(TableProperty::EnableChangeDataFeed, Some("true"))
+            .await?;
+        let schema: Arc<Schema> = Arc::new(declared.try_into_arrow()?);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "@edits",
+                    "space value",
+                    "literal%2F",
+                    "slash/value",
+                ])),
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["old"; 4])),
+            ],
+        )?;
+        let table = table.write([batch]).await?;
+        let (table, _) = table
+            .update()
+            .with_predicate(col("id").eq(lit("@edits")))
+            .with_update("modified", lit("new"))
+            .await?;
+        let (table, _) = table
+            .delete()
+            .with_predicate(col("id").eq(lit("literal%2F")))
+            .await?;
+        let context = SessionContext::new();
+        let provider = DeltaCdfTableProvider::try_new(table.scan_cdf().with_starting_version(1))?;
+        let batches = context
+            .read_table(Arc::new(provider))?
+            .select_columns(&["id", "modified", "_change_type"])?
+            .collect()
+            .await?;
+        assert_batches_sorted_eq!(
+            [
+                "+-------------+----------+------------------+",
+                "| id          | modified | _change_type     |",
+                "+-------------+----------+------------------+",
+                "| @edits      | new      | update_postimage |",
+                "| @edits      | old      | insert           |",
+                "| @edits      | old      | update_preimage  |",
+                "| literal%2F  | old      | delete           |",
+                "| literal%2F  | old      | insert           |",
+                "| slash/value | old      | insert           |",
+                "| space value | old      | insert           |",
+                "+-------------+----------+------------------+",
+            ],
+            &batches
+        );
+        Ok(())
+    }
 
     /// Regression test for partition pruning in `load_cdf`.
     ///
