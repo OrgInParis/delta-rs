@@ -195,7 +195,7 @@ pub struct Catalog {
     pub storage_location: Option<String>,
     pub properties: HashMap<String, String>,
     pub share_name: String,
-    pub comment: String,
+    pub comment: Option<String>,
     pub created_at: i64,
     pub owner: Option<String>,
     pub updated_at: Option<i64>,
@@ -846,6 +846,34 @@ pub(crate) mod tests {
         let get_schema: Result<GetSchemaResponse, _> = serde_json::from_str(GET_SCHEMA_RESPONSE);
         assert!(get_schema.is_ok());
         assert!(matches!(get_schema.unwrap(), GetSchemaResponse::Success(_)))
+    }
+
+    #[test]
+    fn native_catalog_optional_comment_is_nullable() {
+        for comment in [serde_json::Value::Null, serde_json::json!("description")] {
+            let response = serde_json::json!({
+                "catalogs": [{"name": "catalog", "id": "catalog-id",
+                    "comment": comment, "storage_root": null,
+                    "storage_location": null, "owner": "owner"}],
+                "next_page_token": null
+            });
+            let parsed: ListCatalogsResponse = serde_json::from_value(response).unwrap();
+            let ListCatalogsResponse::Success { catalogs, .. } = parsed else {
+                panic!("a native catalog response must not decode as an API error");
+            };
+            assert_eq!(catalogs[0].comment.as_deref(), comment.as_str());
+        }
+        let absent: Catalog =
+            serde_json::from_value(serde_json::json!({"name":"catalog"})).unwrap();
+        assert!(absent.comment.is_none());
+        for invalid in [serde_json::json!(1), serde_json::json!({})] {
+            assert!(
+                serde_json::from_value::<Catalog>(serde_json::json!({
+                    "name":"catalog", "comment":invalid
+                }))
+                .is_err()
+            );
+        }
     }
 
     #[test]
