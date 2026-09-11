@@ -277,7 +277,10 @@ pub(crate) fn merge_arrow_field(
                     // If it's not Decimal datatype, the new_field remains the left table field.
                 }
             };
-            Ok(new_field)
+            // Nullability belongs to the stored contract, not DataFusion's
+            // inferred input field. Field::try_merge otherwise widens primitive
+            // NOT NULL columns while the branches above preserve them.
+            Ok(new_field.with_nullable(left.is_nullable()))
         }
     }
 }
@@ -383,6 +386,25 @@ mod tests {
     use std::sync::Arc;
 
     use crate::merge_arrow_field;
+
+    #[test]
+    fn merge_schema_preserves_stored_primitive_nullability() {
+        for data_type in [
+            DataType::Boolean,
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Decimal128(18, 2),
+            DataType::Date32,
+        ] {
+            for nullable in [false, true] {
+                let stored = ArrowField::new("value", data_type.clone(), nullable);
+                let incoming = ArrowField::new("value", data_type.clone(), !nullable);
+                let merged = merge_arrow_field(&stored, &incoming, true).unwrap();
+                assert_eq!(merged.is_nullable(), nullable);
+                assert_eq!(merged.data_type(), &data_type);
+            }
+        }
+    }
 
     #[test]
     fn merge_arrow_field_dict_utf8() {

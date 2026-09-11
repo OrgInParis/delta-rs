@@ -1179,6 +1179,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overwrite_nested_projection_preserves_native_schema_and_identity() -> TestResult<()> {
+        let context = create_session().into_inner();
+        let source = context
+            .sql("SELECT CAST(1 AS BIGINT) AS state_order, named_struct('count', CAST(7 AS BIGINT)) AS properties")
+            .await?;
+        context.register_table("nested_source", source.clone().into_view())?;
+        let table = DeltaTable::new_in_memory()
+            .write(Vec::new())
+            .with_input_plan(source.logical_plan().clone())
+            .with_session_state(Arc::new(context.state()))
+            .await?;
+        let original = table.snapshot()?.metadata().clone();
+        let selected = context.sql("SELECT state_order, properties FROM nested_source WHERE properties['count'] > 0 ORDER BY state_order LIMIT 1").await?;
+        let table = table
+            .write(Vec::new())
+            .with_input_plan(selected.logical_plan().clone())
+            .with_session_state(Arc::new(context.state()))
+            .with_save_mode(SaveMode::Overwrite)
+            .await?;
+        assert_eq!(table.snapshot()?.metadata().id(), original.id());
+        assert_eq!(
+            table.snapshot()?.metadata().schema_string(),
+            original.schema_string()
+        );
+        assert_eq!(
+            query_single_i64_row(&table, "SELECT COUNT(*) FROM test").await?,
+            vec![1]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn schema_merge_cannot_relax_stored_not_null_columns() {
+        let original = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            original,
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        let table = DeltaTable::new_in_memory()
+            .write(vec![batch])
+            .await
+            .unwrap();
+        let extended = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("optional", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            extended.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![Some(2)])),
+                Arc::new(arrow_array::Int64Array::from(vec![None])),
+            ],
+        )
+        .unwrap();
+        let table = table
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Append)
+            .with_schema_mode(SchemaMode::Merge)
+            .await
+            .unwrap();
+        let schema = table.snapshot().unwrap().schema();
+        assert!(!schema.field("id").unwrap().is_nullable());
+        assert!(schema.field("optional").unwrap().is_nullable());
+        let invalid = RecordBatch::try_new(
+            extended,
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![None])),
+                Arc::new(arrow_array::Int64Array::from(vec![Some(3)])),
+            ],
+        )
+        .unwrap();
+        assert!(
+            table
+                .write(vec![invalid])
+                .with_save_mode(SaveMode::Append)
+                .with_schema_mode(SchemaMode::Merge)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn test_merge_schema() {
         let batch = get_record_batch(None, false);
         let table = DeltaTable::new_in_memory()

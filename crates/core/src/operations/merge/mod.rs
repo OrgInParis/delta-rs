@@ -88,7 +88,7 @@ use crate::delta_datafusion::{Expression, into_expr, maybe_into_expr};
 use crate::kernel::schema::cast::{merge_arrow_field, merge_arrow_schema};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties, PROTOCOL};
 use crate::kernel::{
-    Action, ActiveAddOptions, AddStatsPolicy, EagerSnapshot, StructTypeExt, new_metadata,
+    Action, ActiveAddOptions, AddStatsPolicy, EagerSnapshot, MetadataExt, StructTypeExt,
     resolve_snapshot,
 };
 use crate::logstore::{LogStore, LogStoreRef};
@@ -1151,11 +1151,9 @@ async fn execute(
         new_schema = Some(schema.clone());
         let schema_struct: StructType = schema.try_into_kernel()?;
         if &schema_struct != snapshot.schema().as_ref() {
-            let action = Action::Metadata(new_metadata(
-                &schema_struct,
-                current_metadata.partition_columns(),
-                snapshot.metadata().configuration(),
-            )?);
+            // Schema evolution is an update of this table, not creation of a
+            // new table. Retain identity, creation time and descriptive metadata.
+            let action = Action::Metadata(current_metadata.clone().with_schema(&schema_struct)?);
             schema_action = Some(action);
         }
     }
@@ -4084,6 +4082,7 @@ mod tests {
     #[tokio::test]
     async fn test_merge_schema_evolution_simple_update() {
         let (table, _) = setup().await;
+        let original_metadata = table.snapshot().unwrap().metadata().clone();
 
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", ArrowDataType::Utf8, true),
@@ -4124,6 +4123,16 @@ mod tests {
             .unwrap();
 
         let last_commit = table.last_commit().await.unwrap();
+        let metadata = table.snapshot().unwrap().metadata();
+        assert_eq!(metadata.id(), original_metadata.id());
+        assert_eq!(metadata.name(), original_metadata.name());
+        assert_eq!(metadata.description(), original_metadata.description());
+        assert_eq!(metadata.created_time(), original_metadata.created_time());
+        assert_eq!(
+            metadata.partition_columns(),
+            original_metadata.partition_columns()
+        );
+        assert_eq!(metadata.configuration(), original_metadata.configuration());
         let parameters = last_commit.operation_parameters.clone().unwrap();
         assert_eq!(parameters["mergePredicate"], json!("target.id = source.id"));
         let expected = vec![

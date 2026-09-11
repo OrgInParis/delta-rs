@@ -354,14 +354,19 @@ pub(super) fn prepare_write(input: WritePreparationInput<'_>) -> DeltaResult<Pre
     if let Some(new_schema) = new_schema.as_ref() {
         let mut schema_evolution_projection = Vec::with_capacity(new_schema.fields().len());
         for field in new_schema.fields() {
-            if source_schema.index_of(field.name()).is_ok() {
-                let cast_fn = if safe_cast { try_cast } else { cast };
+            if let Ok(source_field) = source_schema.field_with_name(field.name()) {
+                let column = Expr::Column(Column::from_name(field.name()));
+                // Keep unchanged columns as columns. A no-op CAST simplifies
+                // to a self-alias; DataFusion's leaf-extraction optimizer can
+                // then append a duplicate pass-through field while combining
+                // this projection with nested-field extraction below it.
                 schema_evolution_projection.push(
-                    cast_fn(
-                        Expr::Column(Column::from_name(field.name())),
-                        field.data_type().clone(),
-                    )
-                    .alias(field.name()),
+                    if source_field.data_type() == field.data_type() {
+                        column
+                    } else {
+                        let cast_fn = if safe_cast { try_cast } else { cast };
+                        cast_fn(column, field.data_type().clone()).alias(field.name())
+                    },
                 );
             } else {
                 schema_evolution_projection.push(
