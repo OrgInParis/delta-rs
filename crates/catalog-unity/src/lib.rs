@@ -41,6 +41,7 @@ use deltalake_core::logstore::{
     ObjectStoreFactory, ObjectStoreRef, config::str_is_truthy, object_store_factories,
 };
 mod catalog_managed;
+pub mod storage_routes;
 pub use catalog_managed::ManagedDeltaTableCreate;
 pub mod client;
 pub mod credential;

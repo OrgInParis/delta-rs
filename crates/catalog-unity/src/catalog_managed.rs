@@ -1154,6 +1154,7 @@ fn transport_storage_options(
     let mut transport = HashMap::new();
     for (key, value) in &options.raw {
         if key.eq_ignore_ascii_case(UNITY_CATALOG_ACCESS_KEY)
+            || key.eq_ignore_ascii_case(crate::storage_routes::UNITY_STORAGE_ROUTES_KEY)
             || UnityCatalogConfigKey::from_str(key).is_ok()
         {
             continue;
@@ -1179,6 +1180,27 @@ fn native_log_store(
     vended_options: &HashMap<String, String>,
 ) -> DeltaResult<LogStoreRef> {
     let mut storage_options = transport_storage_options(storage_config)?;
+    if let Some(encoded) = storage_config
+        .raw
+        .get(crate::storage_routes::UNITY_STORAGE_ROUTES_KEY)
+    {
+        let routes =
+            crate::storage_routes::CatalogStorageRoutes::decode(encoded).map_err(|error| {
+                DeltaTableError::GenericError {
+                    source: Box::new(error),
+                }
+            })?;
+        let location = Url::parse(location).map_err(|_| DeltaTableError::GenericError {
+            source: Box::new(crate::storage_routes::StorageRouteError::Root),
+        })?;
+        let route =
+            routes
+                .for_location(&location)
+                .map_err(|error| DeltaTableError::GenericError {
+                    source: Box::new(error),
+                })?;
+        storage_options.extend(route.options());
+    }
     storage_options.extend(vended_options.clone());
 
     let location = ensure_table_uri(location)?;
