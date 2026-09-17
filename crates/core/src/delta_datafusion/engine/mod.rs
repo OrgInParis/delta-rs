@@ -5,7 +5,8 @@ use datafusion::execution::TaskContext;
 use delta_kernel::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
 use tokio::runtime::Handle;
 
-pub(crate) use self::expressions::*;
+pub use self::expressions::to_datafusion_expr;
+pub(crate) use self::expressions::{datafusion_scalar_to_scalar, predicate_to_df, to_datafusion_scalar, to_delta_expression, to_delta_predicate};
 use self::file_formats::DataFusionFileFormatHandler;
 pub use self::storage::AsObjectStoreUrl;
 use self::storage::DataFusionStorageHandler;

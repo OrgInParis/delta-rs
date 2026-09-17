@@ -1469,6 +1469,12 @@ impl EagerSnapshot {
         &self.snapshot
     }
 
+    /// Build a native scan of this already-resolved snapshot, preserving its
+    /// catalog-managed commit visibility and exact version.
+    pub fn scan_builder(&self) -> ScanBuilder {
+        self.snapshot.scan_builder()
+    }
+
     /// Get the table version of the snapshot
     pub fn version(&self) -> Version {
         self.snapshot.version()

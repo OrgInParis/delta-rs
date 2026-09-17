@@ -43,6 +43,7 @@ use deltalake_core::logstore::{
 mod catalog_managed;
 pub mod storage_routes;
 pub use catalog_managed::ManagedDeltaTableCreate;
+pub use catalog_managed::vend_read_storage_options;
 pub mod client;
 pub mod credential;
 pub mod delta;

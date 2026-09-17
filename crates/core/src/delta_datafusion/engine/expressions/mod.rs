@@ -1,4 +1,5 @@
-pub(crate) use self::to_datafusion::*;
+pub use self::to_datafusion::to_datafusion_expr;
+pub(crate) use self::to_datafusion::{predicate_to_df, to_datafusion_scalar};
 pub(crate) use self::to_kernel::*;
 
 mod to_datafusion;

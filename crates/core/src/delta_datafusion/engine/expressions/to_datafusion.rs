@@ -26,7 +26,7 @@ use crate::delta_datafusion::engine::expressions::to_json::to_json;
 ///
 /// Recursively transforms Delta kernel expressions (literals, columns, predicates, etc.)
 /// into their DataFusion equivalents, using the provided output type for type inference.
-pub(crate) fn to_datafusion_expr(expr: &Expression, output_type: &DataType) -> DFResult<Expr> {
+pub fn to_datafusion_expr(expr: &Expression, output_type: &DataType) -> DFResult<Expr> {
     match expr {
         Expression::Literal(scalar) => to_datafusion_scalar(scalar).map(lit),
         Expression::Column(name) => {

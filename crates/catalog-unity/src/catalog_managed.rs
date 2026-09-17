@@ -47,6 +47,20 @@ const CLUSTERING_DOMAIN: &str = "delta.clustering";
 const ROW_TRACKING_DOMAIN: &str = "delta.rowTracking";
 const SYSTEM_DOMAIN_PREFIX: &str = "delta.";
 
+/// Vend fresh READ-only storage credentials through the catalog session that
+/// opened this managed table. No ambient credential fallback is permitted.
+pub async fn vend_read_storage_options(
+    store: &dyn LogStore,
+) -> Result<crate::delta::VendedStorageOptions, UnityCatalogError> {
+    let store = store.any_ref().downcast_ref::<CatalogManagedLogStore>().ok_or(
+        UnityCatalogError::InvalidDeltaCredential { reason: "not_catalog_managed" },
+    )?;
+    let state = store.refresh_catalog_state().await?;
+    store.catalog.delta_table_credentials(&store.table, DeltaCredentialOperation::Read)
+        .await?
+        .storage_options_for(&state.location, DeltaCredentialOperation::Read)
+}
+
 const CALLER_STORAGE_IDENTITY_OPTIONS: &[&str] = &[
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
